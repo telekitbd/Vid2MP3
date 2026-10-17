@@ -1,0 +1,31 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Generate android project
+        run: flutter create --platforms=android --org com.audiotool .
+      - name: Set minSdk 24
+        run: |
+          for f in android/app/build.gradle android/app/build.gradle.kts; do
+            [ -f "$f" ] && sed -i 's/flutter.minSdkVersion/24/' "$f"
+          done
+      - run: flutter pub get
+      - run: flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audio-tool-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
