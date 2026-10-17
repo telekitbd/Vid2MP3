@@ -37,6 +37,19 @@ jobs:
           sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' android/app/src/main/AndroidManifest.xml
           grep -n "INTERNET" android/app/src/main/AndroidManifest.xml
 
+      - name: Force compileSdk 36 for all plugins
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/force-sdk.gradle <<'EOF'
+          allprojects {
+            afterEvaluate { p ->
+              if (p.hasProperty('android')) {
+                p.android.compileSdkVersion 36
+              }
+            }
+          }
+          EOF
+
       - name: Get packages
         working-directory: ${{ env.APP_DIR }}
         run: flutter pub get
