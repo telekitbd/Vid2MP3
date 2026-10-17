@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_new_audio/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -36,7 +35,7 @@ class Home extends StatefulWidget {
 }
 
 class _HomeState extends State<Home> {
-  String? videoPath, dubPath, outPath;
+  String? videoPath, dubPath, outPath, audioSrc;
   bool busy = false;
   String status = 'ভিডিও সিলেক্ট করুন';
   String lang = 'bn'; // bn = বাংলা, hi = হিন্দি
@@ -69,6 +68,17 @@ class _HomeState extends State<Home> {
       setState(() {
         dubPath = r!.files.single.path;
         outPath = null;
+      });
+    }
+  }
+
+  Future<void> pickAudioSrc() async {
+    final r = await FilePicker.platform.pickFiles(type: FileType.audio);
+    if (r?.files.single.path != null) {
+      setState(() {
+        audioSrc = r!.files.single.path;
+        outPath = null;
+        status = 'অডিও রেডি';
       });
     }
   }
@@ -189,15 +199,21 @@ class _HomeState extends State<Home> {
   }
 
   Future<double> _dur(String p) async {
-    final s = await FFprobeKit.getMediaInformation(p);
-    return double.tryParse(s.getMediaInformation()?.getDuration() ?? '') ?? 0;
+    final s = await FFmpegKit.executeWithArguments(['-i', p]);
+    final log = await s.getAllLogsAsString() ?? '';
+    final m = RegExp(r'Duration: (\d+):(\d+):(\d+\.?\d*)').firstMatch(log);
+    if (m == null) return 0;
+    return int.parse(m[1]!) * 3600 +
+        int.parse(m[2]!) * 60 +
+        double.parse(m[3]!);
   }
 
   void _st(String m) => setState(() => status = m);
 
-  Future<void> aiDub() async {
+  Future<void> aiDub({bool audioOnly = false}) async {
     final key = keyCtrl.text.trim();
-    if (videoPath == null) return;
+    final src = audioOnly ? audioSrc : videoPath;
+    if (src == null) return;
     if (key.isEmpty) {
       _st('আগে Groq API key দিন (ফ্রি)');
       return;
@@ -213,7 +229,7 @@ class _HomeState extends State<Home> {
 
       _st('১/৪ অডিও বের হচ্ছে...');
       final wav = '${tmp.path}/src_$id.mp3';
-      if (!await _ff(['-y', '-i', videoPath!, '-vn', '-ac', '1', '-ar', '16000',
+      if (!await _ff(['-y', '-i', src, '-vn', '-ac', '1', '-ar', '16000',
         '-c:a', 'libmp3lame', '-b:a', '48k', wav])) {
         throw 'অডিও এক্সট্রাক্ট ব্যর্থ';
       }
@@ -248,19 +264,26 @@ class _HomeState extends State<Home> {
         if (tempo > 1.8) tempo = 1.8;
         final ms = (s.start * 1000).round();
         final t = tempo > 1.01 ? 'atempo=${tempo.toStringAsFixed(3)},' : '';
-        fc.write('[${i + 1}:a]${t}adelay=$ms|$ms[a$i];');
+        final idx = audioOnly ? i : i + 1;
+        fc.write('[$idx:a]${t}adelay=$ms|$ms[a$i];');
         labels.write('[a$i]');
       }
       fc.write('${labels}amix=inputs=${files.length}:normalize=0[out]');
 
-      final out = await _outFile('mp4');
-      final args = <String>['-y', '-i', videoPath!];
+      final out = await _outFile(audioOnly ? 'mp3' : 'mp4');
+      final List<String> args =
+          audioOnly ? ['-y'] : ['-y', '-i', videoPath!];
       for (final f in files) {
         args.addAll(['-i', f]);
       }
-      args.addAll(['-filter_complex', fc.toString(), '-map', '0:v:0',
-        '-map', '[out]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', out]);
-      if (!await _ff(args)) throw 'ভিডিও মার্জ ব্যর্থ';
+      if (audioOnly) {
+        args.addAll(['-filter_complex', fc.toString(), '-map', '[out]',
+          '-c:a', 'libmp3lame', '-b:a', '192k', out]);
+      } else {
+        args.addAll(['-filter_complex', fc.toString(), '-map', '0:v:0',
+          '-map', '[out]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', out]);
+      }
+      if (!await _ff(args)) throw 'মার্জ ব্যর্থ';
 
       setState(() {
         outPath = out;
@@ -322,6 +345,27 @@ class _HomeState extends State<Home> {
             onPressed: busy || videoPath == null ? null : aiDub,
             icon: const Icon(Icons.auto_awesome),
             label: const Text('AI দিয়ে ডাব করুন'),
+          ),
+          const Divider(height: 32),
+          const Text('🎧 অডিও ফাইল AI ডাব (MP3 আউটপুট)',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+          const SizedBox(height: 8),
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.audio_file),
+              title: const Text('অডিও ফাইল'),
+              subtitle: Text(_name(audioSrc)),
+              trailing: OutlinedButton(
+                  onPressed: busy ? null : pickAudioSrc,
+                  child: const Text('Select')),
+            ),
+          ),
+          const SizedBox(height: 8),
+          FilledButton.icon(
+            onPressed:
+                busy || audioSrc == null ? null : () => aiDub(audioOnly: true),
+            icon: const Icon(Icons.auto_awesome),
+            label: const Text('অডিও AI ডাব করুন (MP3)'),
           ),
           const Divider(height: 32),
           const Text('🎙️ নিজের অডিও দিয়ে ডাব',
