@@ -1,7 +1,6 @@
 name: Build APK
 on:
   push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -9,26 +8,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Find app folder
+        run: |
+          P=$(find . -name pubspec.yaml -not -path '*/android/*' -not -path '*/.dart_tool/*' | head -1)
+          echo "pubspec: $P"
+          echo "APP_DIR=$(dirname "$P")" >> $GITHUB_ENV
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+
       - name: Generate android project
-        run: flutter create --platforms=android --org com.audiotool .
-      - name: Set minSdk 24
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter create --platforms=android --project-name audio_tool --org com.audiotool .
+
+      - name: Fix minSdk and INTERNET permission
+        working-directory: ${{ env.APP_DIR }}
         run: |
           for f in android/app/build.gradle android/app/build.gradle.kts; do
             [ -f "$f" ] && sed -i 's/flutter.minSdkVersion/24/' "$f"
           done
-      - name: Add INTERNET permission
-        run: |
           sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' android/app/src/main/AndroidManifest.xml
-      - run: flutter pub get
-      - run: flutter build apk --release
+          grep -n "INTERNET" android/app/src/main/AndroidManifest.xml
+
+      - name: Get packages
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter build apk --release --no-shrink
+
       - uses: actions/upload-artifact@v4
         with:
           name: audio-tool-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: ${{ env.APP_DIR }}/build/app/outputs/flutter-apk/app-release.apk
