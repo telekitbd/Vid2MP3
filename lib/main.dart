@@ -390,8 +390,8 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
 
   // ---------- ffmpeg ----------
   Future<bool> _ff(List<String> args,
-      {double? total, double from = 0, double to = 1}) async {
-    Log.add('ffmpeg: ${_tail(args.join(" "), 400)}');
+      {double? total, double from = 0, double to = 1, bool quiet = false}) async {
+    if (!quiet) Log.add('ffmpeg: ${_tail(args.join(" "), 400)}');
     final c = Completer<bool>();
     await FFmpegKit.executeWithArgumentsAsync(args, (s) async {
       final rc = await s.getReturnCode();
@@ -771,7 +771,7 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
       '-y', '-i', f, '-af',
       'aresample=24000,asetrate=$rate,aresample=24000,atempo=${(1 / factor).toStringAsFixed(4)}',
       '-c:a', 'libmp3lame', '-b:a', '64k', o
-    ]);
+    ], quiet: true);
     if (!ok) {
       Log.add('⚠️ ভয়েস পিচ বদলানো যায়নি, আসল ভয়েসই থাকছে');
       return f;
