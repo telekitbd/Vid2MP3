@@ -1,17 +1,75 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui' show PlatformDispatcher;
 import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
-void main() => runApp(const App());
+class Log {
+  static final List<String> lines = [];
+  static File? _file;
+  static final ValueNotifier<int> tick = ValueNotifier(0);
+
+  static Future<void> init() async {
+    try {
+      final d = await getApplicationSupportDirectory();
+      _file = File('${d.path}/app_log.txt');
+      if (await _file!.exists()) {
+        var t = await _file!.readAsString();
+        if (t.length > 300000) {
+          t = t.substring(t.length - 100000);
+          await _file!.writeAsString(t);
+        }
+        lines.addAll(t.split('\n').where((e) => e.trim().isNotEmpty));
+      }
+    } catch (_) {}
+    add('=== অ্যাপ চালু === Android: ${Platform.operatingSystemVersion}');
+  }
+
+  static void add(String m) {
+    final t = DateTime.now().toString().substring(0, 19);
+    final l = '[$t] $m';
+    lines.add(l);
+    if (lines.length > 3000) lines.removeRange(0, 800);
+    try {
+      _file?.writeAsStringSync('$l\n', mode: FileMode.append, flush: true);
+    } catch (_) {}
+    tick.value++;
+  }
+
+  static Future<void> clear() async {
+    lines.clear();
+    try {
+      await _file?.writeAsString('');
+    } catch (_) {}
+    tick.value++;
+  }
+
+  static String text() => lines.join('\n');
+
+  static String recent([int n = 400]) =>
+      lines.skip(lines.length > n ? lines.length - n : 0).join('\n');
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Log.init();
+  FlutterError.onError = (d) {
+    Log.add('FlutterError: ${d.exceptionAsString()}\n${d.stack}');
+  };
+  PlatformDispatcher.instance.onError = (e, st) {
+    Log.add('PlatformError: $e\n$st');
+    return true;
+  };
+  runApp(const App());
+}
 
 class App extends StatelessWidget {
   const App({super.key});
@@ -50,6 +108,9 @@ class _HomeState extends State<Home> {
 
   String lang = 'bn';
   final keyCtrl = TextEditingController();
+  bool keyVisible = false;
+  String savedKey = '';
+  String keyMsg = '';
 
   bool busy = false;
   String busyName = '';
@@ -64,10 +125,85 @@ class _HomeState extends State<Home> {
   @override
   void initState() {
     super.initState();
-    SharedPreferences.getInstance().then((p) {
-      keyCtrl.text = p.getString('groq_key') ?? '';
+    _readKey().then((k) {
+      if (!mounted) return;
+      setState(() {
+        keyCtrl.text = k;
+        savedKey = k;
+        keyMsg = k.isEmpty ? '' : '✅ সেভ করা key আছে';
+      });
     });
   }
+
+  Future<void> _saveKey() async {
+    final k = keyCtrl.text.trim();
+    if (k.isEmpty) return _toast('আগে key লিখুন');
+    await _writeKey(k);
+    setState(() {
+      savedKey = k;
+      keyMsg = '✅ সেভ হয়েছে, চেক করা হচ্ছে...';
+    });
+    try {
+      final r = await http.get(
+          Uri.parse('https://api.groq.com/openai/v1/models'),
+          headers: {'Authorization': 'Bearer $k'});
+      if (!mounted) return;
+      setState(() => keyMsg = r.statusCode == 200
+          ? '✅ Key সেভ হয়েছে ও ঠিক আছে'
+          : r.statusCode == 401
+              ? '⚠️ সেভ হয়েছে, কিন্তু key ভুল মনে হচ্ছে'
+              : '✅ সেভ হয়েছে (চেক করা যায়নি: ${r.statusCode})');
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => keyMsg = '✅ সেভ হয়েছে (ইন্টারনেট নেই, চেক হয়নি)');
+    }
+  }
+
+  Future<void> _deleteKey() async {
+    await _removeKeyFile();
+    setState(() {
+      keyCtrl.clear();
+      savedKey = '';
+      keyMsg = '🗑️ Key মুছে ফেলা হয়েছে';
+    });
+  }
+
+  // ---------- API key ফাইলে সেভ (shared_preferences ছাড়া) ----------
+  Future<File> _keyFile() async =>
+      File('${(await getApplicationSupportDirectory()).path}/groq_key.txt');
+
+  Future<String> _readKey() async {
+    try {
+      final f = await _keyFile();
+      return await f.exists() ? (await f.readAsString()).trim() : '';
+    } catch (e) {
+      Log.add('key পড়া যায়নি: $e');
+      return '';
+    }
+  }
+
+  Future<void> _writeKey(String k) async {
+    try {
+      await (await _keyFile()).writeAsString(k);
+    } catch (e) {
+      Log.add('key সেভ হয়নি: $e');
+    }
+  }
+
+  Future<void> _removeKeyFile() async {
+    try {
+      final f = await _keyFile();
+      if (await f.exists()) await f.delete();
+    } catch (e) {
+      Log.add('key মোছা যায়নি: $e');
+    }
+  }
+
+  void _openLogs() => Navigator.push(
+      context, MaterialPageRoute(builder: (_) => const LogPage()));
+
+  String _tail(String s, int n) =>
+      s.length <= n ? s : '…${s.substring(s.length - n)}';
 
   // ---------- ছোট হেল্পার ----------
   void _toast(String m) {
@@ -77,6 +213,7 @@ class _HomeState extends State<Home> {
   }
 
   void _step(String l, [double? p]) {
+    if (l != label) Log.add(l);
     if (!mounted) return;
     setState(() {
       label = l;
@@ -112,6 +249,7 @@ class _HomeState extends State<Home> {
     if (!ok) ok = (await Permission.manageExternalStorage.request()).isGranted;
     if (!ok) ok = (await Permission.storage.request()).isGranted;
     storageOk = ok;
+    Log.add('স্টোরেজ পারমিশন: ${ok ? "পেয়েছে" : "পায়নি"}');
   }
 
   Future<String> _save(String tmp, String sub, String base, String ext) async {
@@ -149,9 +287,16 @@ class _HomeState extends State<Home> {
   // ---------- ffmpeg ----------
   Future<bool> _ff(List<String> args,
       {double? total, double from = 0, double to = 1}) async {
+    Log.add('ffmpeg: ${_tail(args.join(" "), 400)}');
     final c = Completer<bool>();
     await FFmpegKit.executeWithArgumentsAsync(args, (s) async {
-      c.complete(ReturnCode.isSuccess(await s.getReturnCode()));
+      final rc = await s.getReturnCode();
+      final ok = ReturnCode.isSuccess(rc);
+      if (!ok) {
+        final out = await s.getAllLogsAsString() ?? '';
+        Log.add('ffmpeg ব্যর্থ (code ${rc?.getValue()}):\n${_tail(out, 2500)}');
+      }
+      c.complete(ok);
     }, null, total == null
         ? null
         : (stat) {
@@ -180,6 +325,7 @@ class _HomeState extends State<Home> {
       _toast('⏳ "$busyName" এখনো চলছে। শেষ না হওয়া পর্যন্ত অপেক্ষা করুন।');
       return;
     }
+    Log.add('▶ "$name" শুরু');
     setState(() {
       busy = true;
       busyName = name;
@@ -191,6 +337,7 @@ class _HomeState extends State<Home> {
     });
     try {
       final p = await job();
+      Log.add('✅ "$name" সম্পন্ন → $p');
       setState(() {
         results[k] = p;
         progress = 1;
@@ -198,8 +345,11 @@ class _HomeState extends State<Home> {
             '${fallbackUsed ? "\n(স্টোরেজ পারমিশন না দেওয়ায় অ্যাপের নিজস্ব ফোল্ডারে সেভ হয়েছে)" : ""}';
       });
       _toast('✅ $name শেষ হয়েছে');
-    } catch (e) {
-      setState(() => status[k] = '❌ ব্যর্থ: $e');
+    } catch (e, st) {
+      Log.add('❌ "$name" ব্যর্থ: $e\n$st');
+      final m = e.toString();
+      setState(() => status[k] =
+          '❌ ব্যর্থ: ${m.length > 160 ? "${m.substring(0, 160)}…" : m}');
     } finally {
       if (mounted) setState(() => busy = false);
     }
@@ -247,6 +397,7 @@ class _HomeState extends State<Home> {
     req.files.add(await http.MultipartFile.fromPath('file', audio));
     final res = await http.Response.fromStream(await req.send());
     if (res.statusCode != 200) {
+      Log.add('Groq ${res.statusCode}: ${_tail(utf8.decode(res.bodyBytes), 400)}');
       throw 'Groq error ${res.statusCode} (key ঠিক আছে?)';
     }
     final j = jsonDecode(utf8.decode(res.bodyBytes));
@@ -301,7 +452,7 @@ class _HomeState extends State<Home> {
   Future<String> _jobAi(String src, bool audioOnly) async {
     final key = keyCtrl.text.trim();
     if (key.isEmpty) throw 'আগে Groq API key দিন (ফ্রি)';
-    (await SharedPreferences.getInstance()).setString('groq_key', key);
+    await _writeKey(key);
 
     _step('পারমিশন চেক...', 0.01);
     await _ensureStorage();
@@ -424,6 +575,14 @@ class _HomeState extends State<Home> {
         padding: const EdgeInsets.all(12),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text(st, style: const TextStyle(fontWeight: FontWeight.w600)),
+          if (st.startsWith('❌')) ...[
+            const SizedBox(height: 6),
+            OutlinedButton.icon(
+              onPressed: _openLogs,
+              icon: const Icon(Icons.bug_report),
+              label: const Text('📋 লগ দেখুন'),
+            ),
+          ],
           if (p != null) ...[
             const SizedBox(height: 6),
             const Text('সেভ হয়েছে:', style: TextStyle(fontSize: 12)),
@@ -487,13 +646,42 @@ class _HomeState extends State<Home> {
             'যেকোনো ভাষার কথা নিজে থেকে বাংলা বা হিন্দিতে ডাব হবে।'),
         TextField(
           controller: keyCtrl,
-          obscureText: true,
-          decoration: const InputDecoration(
+          obscureText: !keyVisible,
+          onChanged: (_) => setState(() {}),
+          decoration: InputDecoration(
             labelText: 'Groq API Key (ফ্রি)',
             helperText: 'console.groq.com/keys থেকে ফ্রিতে নিন',
-            border: OutlineInputBorder(),
+            border: const OutlineInputBorder(),
+            suffixIcon: IconButton(
+              icon: Icon(keyVisible ? Icons.visibility_off : Icons.visibility),
+              onPressed: () => setState(() => keyVisible = !keyVisible),
+            ),
           ),
         ),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(
+            child: FilledButton.icon(
+              onPressed: keyCtrl.text.trim().isEmpty ||
+                      keyCtrl.text.trim() == savedKey
+                  ? null
+                  : _saveKey,
+              icon: const Icon(Icons.save),
+              label: const Text('Key সেভ করুন'),
+            ),
+          ),
+          const SizedBox(width: 8),
+          OutlinedButton.icon(
+            onPressed: savedKey.isEmpty ? null : _deleteKey,
+            icon: const Icon(Icons.delete_outline),
+            label: const Text('মুছুন'),
+          ),
+        ]),
+        if (keyMsg.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(keyMsg, style: const TextStyle(fontSize: 12)),
+          ),
         const SizedBox(height: 10),
         SegmentedButton<String>(
           segments: const [
@@ -566,7 +754,16 @@ class _HomeState extends State<Home> {
   Widget build(BuildContext context) {
     final pages = [_tabExtract, _tabAi, _tabReplace];
     return Scaffold(
-      appBar: AppBar(title: const Text('Vid2MP3')),
+      appBar: AppBar(
+        title: const Text('Vid2MP3'),
+        actions: [
+          IconButton(
+            tooltip: 'লগ',
+            icon: const Icon(Icons.bug_report_outlined),
+            onPressed: _openLogs,
+          ),
+        ],
+      ),
       body: Column(children: [
         if (busy) _progressCard(),
         Expanded(child: pages[tab]()),
@@ -580,6 +777,95 @@ class _HomeState extends State<Home> {
           NavigationDestination(icon: Icon(Icons.swap_horiz), label: 'রিপ্লেস'),
         ],
       ),
+    );
+  }
+}
+
+
+class LogPage extends StatefulWidget {
+  const LogPage({super.key});
+  @override
+  State<LogPage> createState() => _LogPageState();
+}
+
+class _LogPageState extends State<LogPage> {
+  final sc = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    Log.tick.addListener(_refresh);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _down());
+  }
+
+  void _refresh() {
+    if (!mounted) return;
+    setState(() {});
+    WidgetsBinding.instance.addPostFrameCallback((_) => _down());
+  }
+
+  void _down() {
+    if (sc.hasClients) sc.jumpTo(sc.position.maxScrollExtent);
+  }
+
+  @override
+  void dispose() {
+    Log.tick.removeListener(_refresh);
+    sc.dispose();
+    super.dispose();
+  }
+
+  Future<void> _share() async {
+    final d = await getTemporaryDirectory();
+    final f = File('${d.path}/vid2mp3_log.txt');
+    await f.writeAsString(Log.text());
+    await Share.shareXFiles([XFile(f.path)]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('📋 লগ'),
+        actions: [
+          IconButton(
+            tooltip: 'কপি',
+            icon: const Icon(Icons.copy),
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: Log.text()));
+              if (!context.mounted) return;
+              ScaffoldMessenger.of(context)
+                  .showSnackBar(const SnackBar(content: Text('লগ কপি হয়েছে')));
+            },
+          ),
+          IconButton(
+              tooltip: 'শেয়ার', icon: const Icon(Icons.share), onPressed: _share),
+          IconButton(
+              tooltip: 'মুছুন',
+              icon: const Icon(Icons.delete_outline),
+              onPressed: () => Log.clear()),
+        ],
+      ),
+      body: Column(children: [
+        Container(
+          width: double.infinity,
+          color: Theme.of(context).colorScheme.primaryContainer,
+          padding: const EdgeInsets.all(8),
+          child: const Text(
+              'সমস্যা হলে উপরের কপি/শেয়ার চেপে এই লগ পাঠান। অ্যাপ ক্র্যাশ করলেও লগ সেভ থাকে, আবার খুলে এখানে দেখা যাবে।',
+              style: TextStyle(fontSize: 12)),
+        ),
+        Expanded(
+          child: Log.lines.isEmpty
+              ? const Center(child: Text('এখনো কোনো লগ নেই'))
+              : SingleChildScrollView(
+                  controller: sc,
+                  padding: const EdgeInsets.all(10),
+                  child: SelectableText(Log.recent(),
+                      style: const TextStyle(fontFamily: 'monospace', fontSize: 11)),
+                ),
+        ),
+      ]),
     );
   }
 }
