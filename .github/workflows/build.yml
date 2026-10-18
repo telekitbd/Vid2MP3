@@ -34,7 +34,8 @@ jobs:
           for f in android/app/build.gradle android/app/build.gradle.kts; do
             [ -f "$f" ] && sed -i 's/flutter.minSdkVersion/24/' "$f"
           done
-          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <application android:requestLegacyExternalStorage="true"#' android/app/src/main/AndroidManifest.xml
+          sed -i 's#android:label="audio_tool"#android:label="Vid2MP3"#' android/app/src/main/AndroidManifest.xml
           grep -n "INTERNET" android/app/src/main/AndroidManifest.xml
 
       - name: Force compileSdk 36 for all plugins
@@ -56,9 +57,9 @@ jobs:
 
       - name: Build APK
         working-directory: ${{ env.APP_DIR }}
-        run: flutter build apk --release --no-shrink
+        run: flutter build apk --release --no-shrink --split-per-abi --split-debug-info=build/debug-info
 
       - uses: actions/upload-artifact@v4
         with:
           name: audio-tool-apk
-          path: ${{ env.APP_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          path: ${{ env.APP_DIR }}/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
