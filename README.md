@@ -1,4 +1,4 @@
-# Vid2MP3 — ভিডিও থেকে অডিও, AI ডাব ও অডিও রিপ্লেস
+# KonthoDub — AI ডাব, ভিডিও থেকে অডিও ও অডিও রিপ্লেস
 
 একটা Android অ্যাপ (Flutter), যা দিয়ে তিনটা কাজ করা যায়:
 
@@ -37,6 +37,14 @@
 ### ৩. অডিও রিপ্লেস
 - ভিডিও ও নতুন অডিও বাছুন। ভিডিও স্ট্রিম কপি হয়, শুধু অডিও বদলায়।
 - সেভ হয়: `AudioTool/Replaced_Video`
+
+### ব্যাকগ্রাউন্ডে চলা
+- কাজ শুরু হলে একটা নোটিফিকেশন আসে (ফোরগ্রাউন্ড সার্ভিস)। স্ক্রিন অফ করলে বা অন্য অ্যাপে গেলেও কাজ চলতে থাকে।
+- প্রথমবার নোটিফিকেশন ও ব্যাটারি অপটিমাইজেশন পারমিশন চাইবে, দুটোই দিন।
+- অ্যাপ জোর করে বন্ধ করলে (recent থেকে সরালে) কাজ থেমে যায়।
+
+### থিম
+- ফোনের সিস্টেম সেটিং অনুযায়ী লাইট বা ডার্ক মোড নিজে থেকে বদলায়।
 
 ### লগ
 - উপরের 🐞 আইকনে সব ধাপের লগ দেখা যায়। কপি বা শেয়ার করা যায়।
@@ -79,12 +87,14 @@ flutter build apk --release --split-per-abi
 ## প্রজেক্টের গঠন
 
 ```
+assets/icon.png               অ্যাপের লোগো
+android_res/                  লোগোর Android আইকন (বিল্ডের সময় বসে)
 lib/main.dart                 পুরো অ্যাপ (UI, লগ, ffmpeg, Groq, Gemini, TTS)
 pubspec.yaml                  ডিপেন্ডেন্সি
 .github/workflows/build.yml   APK বিল্ড
 ```
 
-**মূল প্যাকেজ:** `ffmpeg_kit_flutter_new_audio`, `file_picker`, `path_provider`, `share_plus`, `http`, `permission_handler`
+**মূল প্যাকেজ:** `ffmpeg_kit_flutter_new_audio`, `file_picker`, `path_provider`, `share_plus`, `http`, `permission_handler`, `flutter_foreground_task`
 
 ## সমস্যা হলে
 

@@ -5,6 +5,7 @@ import 'dart:ui' show PlatformDispatcher;
 import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -68,16 +69,50 @@ Future<void> main() async {
     Log.add('PlatformError: $e\n$st');
     return true;
   };
+  _initForeground();
   runApp(const App());
+}
+
+// স্ক্রিন অফ বা অ্যাপ মিনিমাইজ করলেও কাজ চালু রাখতে ফোরগ্রাউন্ড সার্ভিস
+void _initForeground() {
+  try {
+    FlutterForegroundTask.init(
+      androidNotificationOptions: AndroidNotificationOptions(
+        channelId: 'konthodub_task',
+        channelName: 'KonthoDub কাজ চলছে',
+        channelDescription: 'ডাব বা অডিওর কাজ চলার সময় দেখায়',
+        channelImportance: NotificationChannelImportance.LOW,
+        priority: NotificationPriority.LOW,
+      ),
+      iosNotificationOptions: const IOSNotificationOptions(),
+      foregroundTaskOptions: ForegroundTaskOptions(
+        interval: 5000,
+        isOnceEvent: false,
+        autoRunOnBoot: false,
+        allowWakeLock: true,
+        allowWifiLock: true,
+      ),
+    );
+  } catch (e) {
+    Log.add('ফোরগ্রাউন্ড সার্ভিস init ব্যর্থ: $e');
+  }
 }
 
 class App extends StatelessWidget {
   const App({super.key});
   @override
   Widget build(BuildContext context) => MaterialApp(
-        title: 'Vid2MP3',
+        title: 'KonthoDub',
         debugShowCheckedModeBanner: false,
-        theme: ThemeData(colorSchemeSeed: Colors.deepPurple, useMaterial3: true),
+        themeMode: ThemeMode.system,
+        theme: ThemeData(
+            colorSchemeSeed: Colors.deepPurple,
+            brightness: Brightness.light,
+            useMaterial3: true),
+        darkTheme: ThemeData(
+            colorSchemeSeed: Colors.deepPurple,
+            brightness: Brightness.dark,
+            useMaterial3: true),
         home: const Home(),
       );
 }
@@ -268,6 +303,7 @@ class _HomeState extends State<Home> {
       label = l;
       if (p != null) progress = p.clamp(0.0, 1.0);
     });
+    if (busy) _bgNotify(l, progress);
   }
 
   String _fileName(String? p) => p == null ? 'বাছাই করা হয়নি' : p.split('/').last;
@@ -368,6 +404,54 @@ class _HomeState extends State<Home> {
         double.parse(m[3]!);
   }
 
+  // ---------- ব্যাকগ্রাউন্ডে চালু রাখা ----------
+  int _lastNotifPct = -1;
+  DateTime _lastNotifAt = DateTime(2000);
+
+  Future<void> _bgStart(String name) async {
+    try {
+      if (Platform.isAndroid) {
+        await Permission.notification.request();
+        if (!await Permission.ignoreBatteryOptimizations.isGranted) {
+          await Permission.ignoreBatteryOptimizations.request();
+        }
+      }
+      _lastNotifPct = -1;
+      await FlutterForegroundTask.startService(
+        notificationTitle: 'KonthoDub — $name চলছে',
+        notificationText: 'স্ক্রিন অফ করলেও কাজ চলবে। অ্যাপ বন্ধ করবেন না।',
+      );
+      Log.add('ব্যাকগ্রাউন্ড সার্ভিস চালু');
+    } catch (e) {
+      Log.add('⚠️ ব্যাকগ্রাউন্ড সার্ভিস চালু হয়নি: $e');
+    }
+  }
+
+  Future<void> _bgStop() async {
+    try {
+      await FlutterForegroundTask.stopService();
+    } catch (e) {
+      Log.add('ব্যাকগ্রাউন্ড সার্ভিস বন্ধ করা যায়নি: $e');
+    }
+  }
+
+  void _bgNotify(String l, double p) {
+    final pct = (p * 100).round();
+    final now = DateTime.now();
+    if (pct == _lastNotifPct ||
+        now.difference(_lastNotifAt).inSeconds < 3) {
+      return;
+    }
+    _lastNotifPct = pct;
+    _lastNotifAt = now;
+    try {
+      FlutterForegroundTask.updateService(
+        notificationTitle: 'KonthoDub — $busyName ($pct%)',
+        notificationText: l,
+      );
+    } catch (_) {}
+  }
+
   // ---------- কাজ চালানোর কমন সিস্টেম ----------
   Future<void> _start(String k, String name, Future<String> Function() job) async {
     if (busy) {
@@ -384,6 +468,7 @@ class _HomeState extends State<Home> {
       results.remove(k);
       status[k] = '⏳ কাজ চলছে...';
     });
+    await _bgStart(name);
     try {
       final p = await job();
       Log.add('✅ "$name" সম্পন্ন → $p');
@@ -400,6 +485,7 @@ class _HomeState extends State<Home> {
       setState(() => status[k] =
           '❌ ব্যর্থ: ${m.length > 160 ? "${m.substring(0, 160)}…" : m}');
     } finally {
+      await _bgStop();
       if (mounted) setState(() => busy = false);
     }
   }
@@ -774,7 +860,9 @@ class _HomeState extends State<Home> {
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Text(t, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
           const SizedBox(height: 4),
-          Text(sub, style: TextStyle(color: Colors.grey.shade700)),
+          Text(sub,
+              style: TextStyle(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant)),
         ]),
       );
 
@@ -1052,7 +1140,7 @@ class _HomeState extends State<Home> {
     final pages = [_tabExtract, _tabAi, _tabReplace];
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Vid2MP3'),
+        title: const Text('KonthoDub'),
         actions: [
           IconButton(
             tooltip: 'লগ',
@@ -1114,7 +1202,7 @@ class _LogPageState extends State<LogPage> {
 
   Future<void> _share() async {
     final d = await getTemporaryDirectory();
-    final f = File('${d.path}/vid2mp3_log.txt');
+    final f = File('${d.path}/konthodub_log.txt');
     await f.writeAsString(Log.text());
     await Share.shareXFiles([XFile(f.path)]);
   }
