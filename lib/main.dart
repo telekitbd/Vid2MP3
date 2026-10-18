@@ -112,6 +112,14 @@ class _HomeState extends State<Home> {
   String savedKey = '';
   String keyMsg = '';
 
+  // Gemini (ছেলে/মেয়ে সনাক্ত)
+  final gKeyCtrl = TextEditingController();
+  bool gKeyVisible = false;
+  String savedGKey = '';
+  String gKeyMsg = '';
+  bool useGender = true;
+  double bgVol = 0; // 0 = ব্যাকগ্রাউন্ড সাউন্ড বন্ধ
+
   bool busy = false;
   String busyName = '';
   String label = '';
@@ -132,6 +140,47 @@ class _HomeState extends State<Home> {
         savedKey = k;
         keyMsg = k.isEmpty ? '' : '✅ সেভ করা key আছে';
       });
+    });
+    _readKey('gemini_key.txt').then((k) {
+      if (!mounted) return;
+      setState(() {
+        gKeyCtrl.text = k;
+        savedGKey = k;
+        gKeyMsg = k.isEmpty ? '' : '✅ সেভ করা Gemini key আছে';
+      });
+    });
+  }
+
+  Future<void> _saveGKey() async {
+    final k = gKeyCtrl.text.trim();
+    if (k.isEmpty) return _toast('আগে Gemini key লিখুন');
+    await _writeKey(k, 'gemini_key.txt');
+    setState(() {
+      savedGKey = k;
+      gKeyMsg = '✅ সেভ হয়েছে, চেক করা হচ্ছে...';
+    });
+    try {
+      final r = await http.get(
+          Uri.parse('https://generativelanguage.googleapis.com/v1beta/models'),
+          headers: {'x-goog-api-key': k});
+      if (!mounted) return;
+      setState(() => gKeyMsg = r.statusCode == 200
+          ? '✅ Gemini key সেভ হয়েছে ও ঠিক আছে'
+          : (r.statusCode == 400 || r.statusCode == 403)
+              ? '⚠️ সেভ হয়েছে, কিন্তু key ভুল মনে হচ্ছে'
+              : '✅ সেভ হয়েছে (চেক করা যায়নি: ${r.statusCode})');
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => gKeyMsg = '✅ সেভ হয়েছে (ইন্টারনেট নেই, চেক হয়নি)');
+    }
+  }
+
+  Future<void> _deleteGKey() async {
+    await _removeKeyFile('gemini_key.txt');
+    setState(() {
+      gKeyCtrl.clear();
+      savedGKey = '';
+      gKeyMsg = '🗑️ Gemini key মুছে ফেলা হয়েছে';
     });
   }
 
@@ -169,12 +218,12 @@ class _HomeState extends State<Home> {
   }
 
   // ---------- API key ফাইলে সেভ (shared_preferences ছাড়া) ----------
-  Future<File> _keyFile() async =>
-      File('${(await getApplicationSupportDirectory()).path}/groq_key.txt');
+  Future<File> _keyFile([String n = 'groq_key.txt']) async =>
+      File('${(await getApplicationSupportDirectory()).path}/$n');
 
-  Future<String> _readKey() async {
+  Future<String> _readKey([String n = 'groq_key.txt']) async {
     try {
-      final f = await _keyFile();
+      final f = await _keyFile(n);
       return await f.exists() ? (await f.readAsString()).trim() : '';
     } catch (e) {
       Log.add('key পড়া যায়নি: $e');
@@ -182,17 +231,17 @@ class _HomeState extends State<Home> {
     }
   }
 
-  Future<void> _writeKey(String k) async {
+  Future<void> _writeKey(String k, [String n = 'groq_key.txt']) async {
     try {
-      await (await _keyFile()).writeAsString(k);
+      await (await _keyFile(n)).writeAsString(k);
     } catch (e) {
       Log.add('key সেভ হয়নি: $e');
     }
   }
 
-  Future<void> _removeKeyFile() async {
+  Future<void> _removeKeyFile([String n = 'groq_key.txt']) async {
     try {
-      final f = await _keyFile();
+      final f = await _keyFile(n);
       if (await f.exists()) await f.delete();
     } catch (e) {
       Log.add('key মোছা যায়নি: $e');
@@ -449,10 +498,151 @@ class _HomeState extends State<Home> {
     await sink.close();
   }
 
+  // ---------- Gemini: কে ছেলে, কে মেয়ে ----------
+  Future<void> _identify(String src, List<Seg> segs, String gKey,
+      List<String> out, int id, String dir) async {
+    final small = '$dir/gem_$id.mp3';
+    if (!await _ff(['-y', '-i', src, '-vn', '-ac', '1', '-ar', '16000',
+      '-c:a', 'libmp3lame', '-b:a', '24k', small])) {
+      throw 'Gemini-র জন্য অডিও বানানো যায়নি';
+    }
+    final bytes = await File(small).readAsBytes();
+    try {
+      await File(small).delete();
+    } catch (_) {}
+    if (bytes.length > 14 * 1024 * 1024) {
+      throw 'অডিও অনেক লম্বা (Gemini-তে সরাসরি পাঠানো যায় না)';
+    }
+    final list = StringBuffer();
+    for (var i = 0; i < segs.length; i++) {
+      final s = segs[i];
+      final t = String.fromCharCodes(s.text.runes.take(50));
+      list.writeln(
+          '$i | ${s.start.toStringAsFixed(1)}-${s.end.toStringAsFixed(1)} | $t');
+    }
+    final prompt =
+        'Below is a list of speech segments from the attached audio, as '
+        '"id | start-end seconds | text". For EVERY id, listen to that time '
+        'range and decide whether the speaker is male or female, and give a '
+        'consistent speaker number (the same person always gets the same '
+        'number, starting from 1). Return a JSON array with one object per '
+        'id, in order.\n\n$list';
+    final body = jsonEncode({
+      'contents': [
+        {
+          'parts': [
+            {'inline_data': {'mime_type': 'audio/mp3', 'data': base64Encode(bytes)}},
+            {'text': prompt},
+          ]
+        }
+      ],
+      'generationConfig': {
+        'temperature': 0,
+        'responseMimeType': 'application/json',
+        'responseSchema': {
+          'type': 'ARRAY',
+          'items': {
+            'type': 'OBJECT',
+            'properties': {
+              'id': {'type': 'INTEGER'},
+              'gender': {
+                'type': 'STRING',
+                'enum': ['male', 'female']
+              },
+              'speaker': {'type': 'INTEGER'},
+            },
+            'required': ['id', 'gender', 'speaker'],
+          },
+        },
+      },
+    });
+
+    const models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-3.5-flash'];
+    String lastErr = 'unknown';
+    for (final m in models) {
+      Log.add('Gemini মডেল: $m');
+      http.Response res;
+      try {
+        res = await http
+            .post(
+                Uri.parse(
+                    'https://generativelanguage.googleapis.com/v1beta/models/$m:generateContent'),
+                headers: {
+                  'Content-Type': 'application/json',
+                  'x-goog-api-key': gKey,
+                },
+                body: body)
+            .timeout(const Duration(minutes: 5));
+      } catch (e) {
+        lastErr = '$m: $e';
+        Log.add('Gemini অনুরোধ ব্যর্থ: $e');
+        continue;
+      }
+      if (res.statusCode != 200) {
+        lastErr = '$m: HTTP ${res.statusCode}';
+        Log.add('Gemini ${res.statusCode}: ${_tail(utf8.decode(res.bodyBytes), 400)}');
+        if (res.statusCode == 400 ||
+            res.statusCode == 401 ||
+            res.statusCode == 403) {
+          throw 'Gemini key ঠিক নেই? ($lastErr)';
+        }
+        continue;
+      }
+      try {
+        final j = jsonDecode(utf8.decode(res.bodyBytes));
+        final parts = j['candidates'][0]['content']['parts'] as List;
+        var txt = parts.map((e) => (e['text'] ?? '') as String).join();
+        txt = txt.replaceAll(RegExp(r'```json|```'), '').trim();
+        final arr = jsonDecode(txt) as List;
+        var male = 0, female = 0;
+        final speakers = <int>{};
+        for (final e in arr) {
+          final i = (e['id'] as num).toInt();
+          if (i < 0 || i >= out.length) continue;
+          final g = (e['gender'] as String).toLowerCase();
+          out[i] = g.startsWith('m') ? 'male' : 'female';
+          final sp = e['speaker'];
+          if (sp is num) speakers.add(sp.toInt());
+        }
+        for (final g in out) {
+          g == 'male' ? male++ : female++;
+        }
+        Log.add('Gemini সনাক্ত: ছেলে $male, মেয়ে $female, '
+            'আলাদা বক্তা ${speakers.length}');
+        return;
+      } catch (e) {
+        lastErr = '$m: উত্তর পড়া যায়নি ($e)';
+        Log.add(lastErr);
+      }
+    }
+    throw lastErr;
+  }
+
+  // ছেলের ভয়েস: পিচ কমানো (গতি একই রেখে)
+  Future<String> _maleVoice(String f) async {
+    final o = f.replaceFirst(RegExp(r'\.mp3$'), '_m.mp3');
+    final ok = await _ff([
+      '-y', '-i', f, '-af',
+      'aresample=24000,asetrate=19680,aresample=24000,atempo=1.2195',
+      '-c:a', 'libmp3lame', '-b:a', '64k', o
+    ]);
+    if (!ok) return f;
+    try {
+      await File(f).delete();
+    } catch (_) {}
+    return o;
+  }
+
   Future<String> _jobAi(String src, bool audioOnly) async {
     final key = keyCtrl.text.trim();
     if (key.isEmpty) throw 'আগে Groq API key দিন (ফ্রি)';
     await _writeKey(key);
+    final gKey = gKeyCtrl.text.trim();
+    final detect = useGender && gKey.isNotEmpty;
+    if (gKey.isNotEmpty) await _writeKey(gKey, 'gemini_key.txt');
+    if (useGender && gKey.isEmpty) {
+      Log.add('Gemini key নেই — সবাই একই ভয়েসে ডাব হবে');
+    }
 
     _step('পারমিশন চেক...', 0.01);
     await _ensureStorage();
@@ -461,32 +651,47 @@ class _HomeState extends State<Home> {
     final tmpDir = await getTemporaryDirectory();
     final total = await _dur(src);
 
-    _step('১/৪ অডিও বের হচ্ছে...', 0.03);
+    _step('১/৫ অডিও বের হচ্ছে...', 0.03);
     final mp3 = '${tmpDir.path}/src_$id.mp3';
     if (!await _ff(['-y', '-i', src, '-vn', '-ac', '1', '-ar', '16000',
       '-c:a', 'libmp3lame', '-b:a', '48k', mp3])) {
       throw 'অডিও এক্সট্রাক্ট হয়নি';
     }
 
-    _step('২/৪ কথা শুনে টেক্সট করা হচ্ছে (একটু সময় লাগবে)...', 0.08);
+    _step('২/৫ কথা শুনে টেক্সট করা হচ্ছে (একটু সময় লাগবে)...', 0.08);
     final segs = await _transcribe(mp3, key);
     if (segs.isEmpty) throw 'কোনো কথা পাওয়া যায়নি';
+
+    // ছেলে/মেয়ে — ব্যর্থ হলে সবাই 'female' (আগের মতো একই ভয়েস)
+    final genders = List<String>.filled(segs.length, 'female');
+    if (detect) {
+      _step('৩/৫ ছেলে-মেয়ে চেনা হচ্ছে (Gemini)...', 0.18);
+      try {
+        await _identify(src, segs, gKey, genders, id, tmpDir.path);
+      } catch (e) {
+        Log.add('⚠️ Gemini সনাক্ত ব্যর্থ, সবাই একই ভয়েসে ডাব হবে: $e');
+        for (var i = 0; i < genders.length; i++) {
+          genders[i] = 'female';
+        }
+      }
+    }
 
     final files = <String>[];
     final used = <Seg>[];
     for (var i = 0; i < segs.length; i++) {
-      _step('৩/৪ অনুবাদ ও ভয়েস তৈরি ${i + 1}/${segs.length}',
+      _step('৪/৫ অনুবাদ ও ভয়েস তৈরি ${i + 1}/${segs.length}',
           0.25 + 0.60 * (i / segs.length));
       final tr = await _translate(segs[i].text, lang);
       if (tr.trim().isEmpty) continue;
-      final f = '${tmpDir.path}/seg_${id}_$i.mp3';
+      var f = '${tmpDir.path}/seg_${id}_$i.mp3';
       await _tts(tr, lang, f);
+      if (genders[i] == 'male') f = await _maleVoice(f);
       files.add(f);
       used.add(segs[i]);
     }
     if (files.isEmpty) throw 'ভয়েস তৈরি হয়নি';
 
-    _step('৪/৪ ফাইনাল ফাইল তৈরি হচ্ছে...', 0.86);
+    _step('৫/৫ ফাইনাল ফাইল তৈরি হচ্ছে...', 0.86);
     final fc = StringBuffer();
     final labels = StringBuffer();
     for (var i = 0; i < files.length; i++) {
@@ -498,14 +703,20 @@ class _HomeState extends State<Home> {
       if (tempo > 1.8) tempo = 1.8;
       final ms = (s.start * 1000).round();
       final t = tempo > 1.01 ? 'atempo=${tempo.toStringAsFixed(3)},' : '';
-      final idx = audioOnly ? i : i + 1;
-      fc.write('[$idx:a]${t}adelay=$ms|$ms[a$i];');
+      // ইনপুট ০ = আসল ফাইল (ব্যাকগ্রাউন্ডের জন্য), ভয়েস ফাইল ১ থেকে
+      fc.write('[${i + 1}:a]${t}adelay=$ms|$ms[a$i];');
       labels.write('[a$i]');
     }
-    fc.write('${labels}amix=inputs=${files.length}:normalize=0[out]');
+    final hasBg = bgVol > 0;
+    if (hasBg) {
+      fc.write('[0:a]volume=${bgVol.toStringAsFixed(2)}[bg];');
+      labels.write('[bg]');
+    }
+    final n = files.length + (hasBg ? 1 : 0);
+    fc.write('${labels}amix=inputs=$n:duration=longest:normalize=0[out]');
 
     final tmp = await _tmp(audioOnly ? 'mp3' : 'mp4');
-    final List<String> args = audioOnly ? ['-y'] : ['-y', '-i', src];
+    final List<String> args = ['-y', '-i', src];
     for (final f in files) {
       args.addAll(['-i', f]);
     }
@@ -643,7 +854,7 @@ class _HomeState extends State<Home> {
   // ---------- ট্যাব ২: AI ডাব ----------
   Widget _tabAi() => ListView(padding: const EdgeInsets.all(16), children: [
         _title('🤖 AI অটো ডাব (বাংলা / হিন্দি)',
-            'যেকোনো ভাষার কথা নিজে থেকে বাংলা বা হিন্দিতে ডাব হবে।'),
+            'যেকোনো ভাষার কথা নিজে থেকে বাংলা বা হিন্দিতে ডাব হবে। Gemini key দিলে ছেলে-মেয়ে আলাদা ভয়েস পাবেন।'),
         TextField(
           controller: keyCtrl,
           obscureText: !keyVisible,
@@ -682,6 +893,70 @@ class _HomeState extends State<Home> {
             padding: const EdgeInsets.only(top: 6),
             child: Text(keyMsg, style: const TextStyle(fontSize: 12)),
           ),
+        const SizedBox(height: 14),
+        TextField(
+          controller: gKeyCtrl,
+          obscureText: !gKeyVisible,
+          onChanged: (_) => setState(() {}),
+          decoration: InputDecoration(
+            labelText: 'Gemini API Key (ফ্রি) — ছেলে/মেয়ে চেনার জন্য',
+            helperText: 'aistudio.google.com/apikey থেকে ফ্রিতে নিন',
+            border: const OutlineInputBorder(),
+            suffixIcon: IconButton(
+              icon: Icon(gKeyVisible ? Icons.visibility_off : Icons.visibility),
+              onPressed: () => setState(() => gKeyVisible = !gKeyVisible),
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(
+            child: FilledButton.icon(
+              onPressed: gKeyCtrl.text.trim().isEmpty ||
+                      gKeyCtrl.text.trim() == savedGKey
+                  ? null
+                  : _saveGKey,
+              icon: const Icon(Icons.save),
+              label: const Text('Gemini key সেভ'),
+            ),
+          ),
+          const SizedBox(width: 8),
+          OutlinedButton.icon(
+            onPressed: savedGKey.isEmpty ? null : _deleteGKey,
+            icon: const Icon(Icons.delete_outline),
+            label: const Text('মুছুন'),
+          ),
+        ]),
+        if (gKeyMsg.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(gKeyMsg, style: const TextStyle(fontSize: 12)),
+          ),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('ছেলে-মেয়ে আলাদা ভয়েস (অটো সনাক্ত)'),
+          subtitle: const Text(
+              'বন্ধ থাকলে বা Gemini key না থাকলে সবাই একই ভয়েসে ডাব হবে। '
+              'ছেলের ভয়েস = পিচ কমানো ভয়েস।'),
+          value: useGender,
+          onChanged: (v) => setState(() => useGender = v),
+        ),
+        Text(
+            'ব্যাকগ্রাউন্ড সাউন্ড (আসল অডিও নিচে রাখা): '
+            '${bgVol <= 0 ? "বন্ধ" : "${(bgVol * 100).round()}%"}',
+            style: const TextStyle(fontWeight: FontWeight.w600)),
+        Slider(
+          value: bgVol,
+          min: 0,
+          max: 0.4,
+          divisions: 8,
+          label: bgVol <= 0 ? 'বন্ধ' : '${(bgVol * 100).round()}%',
+          onChanged: (v) => setState(() => bgVol = v),
+        ),
+        const Text(
+            'মিউজিক/সাউন্ড ইফেক্ট আলাদা করা যায় না — তাই আসল অডিও হালকা ভলিউমে থাকবে, '
+            'আসল কথাও আবছা শোনা যাবে।',
+            style: TextStyle(fontSize: 12)),
         const SizedBox(height: 10),
         SegmentedButton<String>(
           segments: const [
