@@ -35,8 +35,26 @@ jobs:
             [ -f "$f" ] && sed -i 's/flutter.minSdkVersion/24/' "$f"
           done
           sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <application android:requestLegacyExternalStorage="true"#' android/app/src/main/AndroidManifest.xml
-          sed -i 's#android:label="audio_tool"#android:label="Vid2MP3"#' android/app/src/main/AndroidManifest.xml
-          grep -n "INTERNET" android/app/src/main/AndroidManifest.xml
+          sed -i 's#android:label="[^"]*"#android:label="KonthoDub"#' android/app/src/main/AndroidManifest.xml
+          grep -n "android:label\|INTERNET" android/app/src/main/AndroidManifest.xml
+
+      - name: Foreground service and background permissions
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>\n    <application#' $M
+          sed -i 's#</application>#    <service android:name="com.pravera.flutter_foreground_task.service.ForegroundService" android:foregroundServiceType="dataSync" android:exported="false" android:stopWithTask="false"/>\n    </application>#' $M
+          grep -n "FOREGROUND\|WAKE_LOCK\|IGNORE_BATTERY\|ForegroundService" $M
+
+      - name: Apply app icon
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          rm -rf android/app/src/main/res/mipmap-anydpi-v26
+          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            mkdir -p android/app/src/main/res/mipmap-$d
+            cp android_res/mipmap-$d/ic_launcher.png android/app/src/main/res/mipmap-$d/ic_launcher.png
+          done
+          ls -l android/app/src/main/res/mipmap-*/ic_launcher.png
 
       - name: Force compileSdk 36 for all plugins
         run: |
