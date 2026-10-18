@@ -84,11 +84,19 @@ flutter pub get
 flutter build apk --release --split-per-abi
 ```
 
+## আপডেট (পুরনো অ্যাপ মুছে না ফেলে)
+
+- Android শুধু একই সাইনিং key-র APK দিয়ে আপডেট করতে দেয়। এই প্রজেক্টে `ci/debug.keystore` ফাইলটা সবসময় একই key দিয়ে সাইন করে, তাই এরপর থেকে নতুন APK সরাসরি পুরনোটার ওপর ইনস্টল হবে।
+- **`ci/debug.keystore` কখনো মুছবেন না বা বদলাবেন না।** বদলালে আবার পুরনো অ্যাপ মুছে নতুন করে ইনস্টল করতে হবে।
+- প্রতিটা বিল্ডে ভার্সন নম্বর (`--build-number`) নিজে থেকে বাড়ে।
+- যে ফোনে আগের (অন্য key-র) APK আছে, সেখানে প্রথমবার একবার পুরনোটা মুছতে হবে।
+
 ## প্রজেক্টের গঠন
 
 ```
 assets/icon.png               অ্যাপের লোগো
 android_res/                  লোগোর Android আইকন (বিল্ডের সময় বসে)
+ci/debug.keystore             সাইনিং key (মুছবেন না)
 lib/main.dart                 পুরো অ্যাপ (UI, লগ, ffmpeg, Groq, Gemini, TTS)
 pubspec.yaml                  ডিপেন্ডেন্সি
 .github/workflows/build.yml   APK বিল্ড
