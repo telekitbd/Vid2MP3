@@ -153,7 +153,8 @@ class _HomeState extends State<Home> {
   String savedGKey = '';
   String gKeyMsg = '';
   bool useGender = true;
-  double bgVol = 0; // 0 = ব্যাকগ্রাউন্ড সাউন্ড বন্ধ
+  bool keepBg = true; // আসল মিউজিক/সাউন্ড রাখা
+  double bgVol = 0.12; // কথা চলার সময় আসল অডিওর ভলিউম
 
   bool busy = false;
   String busyName = '';
@@ -802,6 +803,7 @@ class _HomeState extends State<Home> {
     _step('৫/৫ ফাইনাল ফাইল তৈরি হচ্ছে...', 0.86);
     final fc = StringBuffer();
     final labels = StringBuffer();
+    final spans = <String>[]; // কথা চলার সময়গুলো (আসল অডিও নিচে নামানোর জন্য)
     for (var i = 0; i < files.length; i++) {
       final s = used[i];
       final nextStart = i + 1 < used.length ? used[i + 1].start : s.end + 1.0;
@@ -811,13 +813,19 @@ class _HomeState extends State<Home> {
       if (tempo > 1.8) tempo = 1.8;
       final ms = (s.start * 1000).round();
       final t = tempo > 1.01 ? 'atempo=${tempo.toStringAsFixed(3)},' : '';
+      final endAt = s.start + d / tempo;
+      final spanEnd = endAt > s.end ? endAt : s.end;
+      spans.add('between(t,${(s.start - 0.15).clamp(0, 1e9).toStringAsFixed(2)},'
+          '${(spanEnd + 0.25).toStringAsFixed(2)})');
       // ইনপুট ০ = আসল ফাইল (ব্যাকগ্রাউন্ডের জন্য), ভয়েস ফাইল ১ থেকে
       fc.write('[${i + 1}:a]${t}adelay=$ms|$ms[a$i];');
       labels.write('[a$i]');
     }
-    final hasBg = bgVol > 0;
+    final hasBg = keepBg;
     if (hasBg) {
-      fc.write('[0:a]volume=${bgVol.toStringAsFixed(2)}[bg];');
+      // কথার সময় আসল অডিও নিচে (bgVol), কথার ফাঁকে বেশি (০.৮) — মিউজিক/ইফেক্ট শোনা যাবে
+      final low = bgVol.toStringAsFixed(2);
+      fc.write("[0:a]volume='if(gt(${spans.join("+")},0),$low,0.8)':eval=frame[bg];");
       labels.write('[bg]');
     }
     final n = files.length + (hasBg ? 1 : 0);
@@ -1051,22 +1059,33 @@ class _HomeState extends State<Home> {
           value: useGender,
           onChanged: (v) => setState(() => useGender = v),
         ),
-        Text(
-            'ব্যাকগ্রাউন্ড সাউন্ড (আসল অডিও নিচে রাখা): '
-            '${bgVol <= 0 ? "বন্ধ" : "${(bgVol * 100).round()}%"}',
-            style: const TextStyle(fontWeight: FontWeight.w600)),
-        Slider(
-          value: bgVol,
-          min: 0,
-          max: 0.4,
-          divisions: 8,
-          label: bgVol <= 0 ? 'বন্ধ' : '${(bgVol * 100).round()}%',
-          onChanged: (v) => setState(() => bgVol = v),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('আসল মিউজিক ও সাউন্ড ইফেক্ট রাখুন'),
+          subtitle: const Text(
+              'কথার ফাঁকে আসল অডিও জোরে শোনা যাবে, কথা চলার সময় নিচে নামবে। '
+              'বন্ধ করলে শুধু ডাবের ভয়েস থাকবে।'),
+          value: keepBg,
+          onChanged: (v) => setState(() => keepBg = v),
         ),
-        const Text(
-            'মিউজিক/সাউন্ড ইফেক্ট আলাদা করা যায় না — তাই আসল অডিও হালকা ভলিউমে থাকবে, '
-            'আসল কথাও আবছা শোনা যাবে।',
-            style: TextStyle(fontSize: 12)),
+        if (keepBg) ...[
+          Text(
+              'কথা চলার সময় আসল অডিও: ${(bgVol * 100).round()}%',
+              style: const TextStyle(fontWeight: FontWeight.w600)),
+          Slider(
+            value: bgVol,
+            min: 0,
+            max: 0.4,
+            divisions: 8,
+            label: '${(bgVol * 100).round()}%',
+            onChanged: (v) => setState(() => bgVol = v),
+          ),
+          const Text(
+              '০% = কথার সময় আসল অডিও পুরো বন্ধ (ফাঁকে মিউজিক থাকবে)। '
+              'বেশি দিলে আসল কথা বেশি শোনা যাবে। মিউজিক আলাদা করা যায় না, '
+              'তাই মিউজিকের ওপর কথা থাকলে সেই অংশে মিউজিকও কমে যাবে।',
+              style: TextStyle(fontSize: 12)),
+        ],
         const SizedBox(height: 10),
         SegmentedButton<String>(
           segments: const [
