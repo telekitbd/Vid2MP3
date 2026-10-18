@@ -13,6 +13,9 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
 
+// বিল্ড নম্বর (GitHub Actions থেকে আসে; 'dev' দেখালে পুরনো workflow দিয়ে বিল্ড হয়েছে)
+const String kBuild = String.fromEnvironment('BUILD_NO', defaultValue: 'dev');
+
 class Log {
   static final List<String> lines = [];
   static File? _file;
@@ -31,7 +34,7 @@ class Log {
         lines.addAll(t.split('\n').where((e) => e.trim().isNotEmpty));
       }
     } catch (_) {}
-    add('=== অ্যাপ চালু === Android: ${Platform.operatingSystemVersion}');
+    add('=== KonthoDub build $kBuild চালু === Android: ${Platform.operatingSystemVersion}');
   }
 
   static void add(String m) {
@@ -129,7 +132,7 @@ class Home extends StatefulWidget {
   State<Home> createState() => _HomeState();
 }
 
-class _HomeState extends State<Home> {
+class _HomeState extends State<Home> with WidgetsBindingObserver {
   static const root = '/storage/emulated/0/AudioTool';
 
   int tab = 0;
@@ -166,9 +169,24 @@ class _HomeState extends State<Home> {
   final Map<String, String> results = {};
   final Map<String, String> status = {};
 
+  bool bgOn = false;
+  String voiceSummary = '';
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState st) {
+    Log.add('অ্যাপ অবস্থা: ${st.name}${busy ? " (কাজ চলছে)" : ""}');
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _readKey().then((k) {
       if (!mounted) return;
       setState(() {
@@ -410,27 +428,39 @@ class _HomeState extends State<Home> {
   DateTime _lastNotifAt = DateTime(2000);
 
   Future<void> _bgStart(String name) async {
+    bgOn = false;
     try {
       if (Platform.isAndroid) {
-        await Permission.notification.request();
+        final n = await Permission.notification.request();
+        Log.add('নোটিফিকেশন পারমিশন: ${n.name}');
         if (!await Permission.ignoreBatteryOptimizations.isGranted) {
-          await Permission.ignoreBatteryOptimizations.request();
+          final b = await Permission.ignoreBatteryOptimizations.request();
+          Log.add('ব্যাটারি অপটিমাইজেশন ছাড়: ${b.name}');
         }
       }
       _lastNotifPct = -1;
-      await FlutterForegroundTask.startService(
+      final r = await FlutterForegroundTask.startService(
         notificationTitle: 'KonthoDub — $name চলছে',
         notificationText: 'স্ক্রিন অফ করলেও কাজ চলবে। অ্যাপ বন্ধ করবেন না।',
       );
-      Log.add('ব্যাকগ্রাউন্ড সার্ভিস চালু');
+      Log.add('startService ফলাফল: $r');
+      bgOn = await FlutterForegroundTask.isRunningService;
+      Log.add(bgOn
+          ? '🔒 ব্যাকগ্রাউন্ড সার্ভিস চালু আছে'
+          : '⚠️ ব্যাকগ্রাউন্ড সার্ভিস চালু হয়নি (মিনিমাইজ করলে কাজ থামতে পারে)');
     } catch (e) {
       Log.add('⚠️ ব্যাকগ্রাউন্ড সার্ভিস চালু হয়নি: $e');
     }
+    if (!bgOn) {
+      _toast('⚠️ ব্যাকগ্রাউন্ড সার্ভিস চালু হয়নি — অ্যাপ মিনিমাইজ করলে কাজ থামতে পারে');
+    }
+    if (mounted) setState(() {});
   }
 
   Future<void> _bgStop() async {
     try {
       await FlutterForegroundTask.stopService();
+      bgOn = false;
     } catch (e) {
       Log.add('ব্যাকগ্রাউন্ড সার্ভিস বন্ধ করা যায়নি: $e');
     }
@@ -467,6 +497,7 @@ class _HomeState extends State<Home> {
       progress = 0;
       fallbackUsed = false;
       results.remove(k);
+      voiceSummary = '';
       status[k] = '⏳ কাজ চলছে...';
     });
     await _bgStart(name);
@@ -477,6 +508,7 @@ class _HomeState extends State<Home> {
         results[k] = p;
         progress = 1;
         status[k] = '✅ সম্পন্ন!'
+            '${voiceSummary.isEmpty ? "" : "\n$voiceSummary"}'
             '${fallbackUsed ? "\n(স্টোরেজ পারমিশন না দেওয়ায় অ্যাপের নিজস্ব ফোল্ডারে সেভ হয়েছে)" : ""}';
       });
       _toast('✅ $name শেষ হয়েছে');
@@ -600,7 +632,7 @@ class _HomeState extends State<Home> {
 
   // ---------- Gemini: কে ছেলে, কে মেয়ে ----------
   Future<void> _identify(String src, List<Seg> segs, String gKey,
-      List<String> out, int id, String dir) async {
+      List<String> out, List<int> spkOut, int id, String dir) async {
     final small = '$dir/gem_$id.mp3';
     if (!await _ff(['-y', '-i', src, '-vn', '-ac', '1', '-ar', '16000',
       '-c:a', 'libmp3lame', '-b:a', '24k', small])) {
@@ -711,7 +743,10 @@ class _HomeState extends State<Home> {
           final g = (e['gender'] as String).toLowerCase();
           out[i] = g.startsWith('m') ? 'male' : 'female';
           final sp = e['speaker'];
-          if (sp is num) speakers.add(sp.toInt());
+          if (sp is num) {
+            speakers.add(sp.toInt());
+            spkOut[i] = sp.toInt();
+          }
         }
         for (final g in out) {
           g == 'male' ? male++ : female++;
@@ -727,15 +762,20 @@ class _HomeState extends State<Home> {
     throw lastErr;
   }
 
-  // ছেলের ভয়েস: পিচ কমানো (গতি একই রেখে)
-  Future<String> _maleVoice(String f) async {
-    final o = f.replaceFirst(RegExp(r'\.mp3$'), '_m.mp3');
+  // ভয়েসের পিচ বদলানো (গতি একই রেখে): factor < 1 = ভারী/ছেলে, > 1 = চিকন
+  Future<String> _shiftVoice(String f, double factor) async {
+    if ((factor - 1.0).abs() < 0.01) return f;
+    final o = f.replaceFirst(RegExp(r'\.mp3$'), '_v.mp3');
+    final rate = (24000 * factor).round();
     final ok = await _ff([
       '-y', '-i', f, '-af',
-      'aresample=24000,asetrate=19680,aresample=24000,atempo=1.2195',
+      'aresample=24000,asetrate=$rate,aresample=24000,atempo=${(1 / factor).toStringAsFixed(4)}',
       '-c:a', 'libmp3lame', '-b:a', '64k', o
     ]);
-    if (!ok) return f;
+    if (!ok) {
+      Log.add('⚠️ ভয়েস পিচ বদলানো যায়নি, আসল ভয়েসই থাকছে');
+      return f;
+    }
     try {
       await File(f).delete();
     } catch (_) {}
@@ -773,20 +813,34 @@ class _HomeState extends State<Home> {
 
     // ছেলে/মেয়ে — ব্যর্থ হলে সবাই 'female' (আগের মতো একই ভয়েস)
     final genders = List<String>.filled(segs.length, 'female');
+    final spk = List<int>.filled(segs.length, 1);
+    voiceSummary = detect
+        ? ''
+        : '🎙 ছেলে-মেয়ে সনাক্ত বন্ধ (সুইচ বন্ধ বা Gemini key নেই) — সবাই একই ভয়েসে';
     if (detect) {
       _step('৩/৫ ছেলে-মেয়ে চেনা হচ্ছে (Gemini)...', 0.18);
       try {
-        await _identify(src, segs, gKey, genders, id, tmpDir.path);
+        await _identify(src, segs, gKey, genders, spk, id, tmpDir.path);
+        final m = genders.where((g) => g == 'male').length;
+        voiceSummary = '🎙 সনাক্ত: ছেলে $m, মেয়ে ${genders.length - m} সেগমেন্ট, '
+            'বক্তা ${spk.toSet().length} জন';
       } catch (e) {
+        voiceSummary =
+            '⚠️ ছেলে-মেয়ে সনাক্ত হয়নি, সবাই একই ভয়েসে (লগ দেখুন)';
         Log.add('⚠️ Gemini সনাক্ত ব্যর্থ, সবাই একই ভয়েসে ডাব হবে: $e');
         for (var i = 0; i < genders.length; i++) {
           genders[i] = 'female';
+          spk[i] = 1;
         }
       }
     }
 
     final files = <String>[];
     final used = <Seg>[];
+    // প্রতি বক্তার জন্য আলাদা পিচ: ছেলে ভারী, মেয়ে স্বাভাবিক/একটু চিকন
+    final order = <String, List<int>>{'male': [], 'female': []};
+    const maleF = [0.74, 0.66, 0.82];
+    const femaleF = [1.0, 1.10, 0.92];
     for (var i = 0; i < segs.length; i++) {
       _step('৪/৫ অনুবাদ ও ভয়েস তৈরি ${i + 1}/${segs.length}',
           0.25 + 0.60 * (i / segs.length));
@@ -794,7 +848,11 @@ class _HomeState extends State<Home> {
       if (tr.trim().isEmpty) continue;
       var f = '${tmpDir.path}/seg_${id}_$i.mp3';
       await _retry(() => _tts(tr, lang, f));
-      if (genders[i] == 'male') f = await _maleVoice(f);
+      final g = genders[i];
+      final lst = order[g]!;
+      if (!lst.contains(spk[i])) lst.add(spk[i]);
+      final idx = lst.indexOf(spk[i]) % 3;
+      f = await _shiftVoice(f, g == 'male' ? maleF[idx] : femaleF[idx]);
       files.add(f);
       used.add(segs[i]);
     }
@@ -945,6 +1003,12 @@ class _HomeState extends State<Home> {
           LinearProgressIndicator(value: progress <= 0 ? null : progress),
           const SizedBox(height: 6),
           Text(label, style: const TextStyle(fontSize: 12)),
+          const SizedBox(height: 4),
+          Text(
+              bgOn
+                  ? '🔒 স্ক্রিন অফ বা মিনিমাইজ করলেও কাজ চলবে'
+                  : '⚠️ ব্যাকগ্রাউন্ড সার্ভিস বন্ধ — মিনিমাইজ করলে থামতে পারে',
+              style: const TextStyle(fontSize: 11)),
         ]),
       ),
     );
@@ -1086,6 +1150,12 @@ class _HomeState extends State<Home> {
               'তাই মিউজিকের ওপর কথা থাকলে সেই অংশে মিউজিকও কমে যাবে।',
               style: TextStyle(fontSize: 12)),
         ],
+        const SizedBox(height: 4),
+        OutlinedButton.icon(
+          onPressed: () => openAppSettings(),
+          icon: const Icon(Icons.battery_saver),
+          label: const Text('অ্যাপ সেটিং খুলুন (ব্যাটারি → Unrestricted দিন)'),
+        ),
         const SizedBox(height: 10),
         SegmentedButton<String>(
           segments: const [
@@ -1159,7 +1229,13 @@ class _HomeState extends State<Home> {
     final pages = [_tabExtract, _tabAi, _tabReplace];
     return Scaffold(
       appBar: AppBar(
-        title: const Text('KonthoDub'),
+        title: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('KonthoDub'),
+              Text('build $kBuild',
+                  style: const TextStyle(fontSize: 10, fontWeight: FontWeight.normal)),
+            ]),
         actions: [
           IconButton(
             tooltip: 'লগ',
