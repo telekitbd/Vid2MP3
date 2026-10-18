@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
@@ -6,6 +7,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -15,7 +17,7 @@ class App extends StatelessWidget {
   const App({super.key});
   @override
   Widget build(BuildContext context) => MaterialApp(
-        title: 'Audio Tool',
+        title: 'Vid2MP3',
         debugShowCheckedModeBanner: false,
         theme: ThemeData(colorSchemeSeed: Colors.deepPurple, useMaterial3: true),
         home: const Home(),
@@ -35,11 +37,29 @@ class Home extends StatefulWidget {
 }
 
 class _HomeState extends State<Home> {
-  String? videoPath, dubPath, outPath, audioSrc;
-  bool busy = false;
-  String status = 'ভিডিও সিলেক্ট করুন';
-  String lang = 'bn'; // bn = বাংলা, hi = হিন্দি
+  static const root = '/storage/emulated/0/AudioTool';
+
+  int tab = 0;
+
+  // প্রতিটা কাজের ফাইল আলাদা — একটা আরেকটার সাথে মিশবে না
+  String? exVideo; // ট্যাব ১: এক্সট্রাক্টের ভিডিও
+  String? aiVideo; // ট্যাব ২ক: AI ডাবের ভিডিও
+  String? aiAudio; // ট্যাব ২খ: AI ডাবের অডিও
+  String? rpVideo; // ট্যাব ৩: রিপ্লেসের ভিডিও
+  String? rpAudio; // ট্যাব ৩: রিপ্লেসের নতুন অডিও
+
+  String lang = 'bn';
   final keyCtrl = TextEditingController();
+
+  bool busy = false;
+  String busyName = '';
+  String label = '';
+  double progress = 0;
+  bool fallbackUsed = false;
+  bool storageOk = false;
+
+  final Map<String, String> results = {};
+  final Map<String, String> status = {};
 
   @override
   void initState() {
@@ -49,93 +69,175 @@ class _HomeState extends State<Home> {
     });
   }
 
-  String _name(String? p) => p == null ? '—' : p.split('/').last;
+  // ---------- ছোট হেল্পার ----------
+  void _toast(String m) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(m)));
+  }
 
-  Future<void> pickVideo() async {
-    final r = await FilePicker.platform.pickFiles(type: FileType.video);
-    if (r?.files.single.path != null) {
-      setState(() {
-        videoPath = r!.files.single.path;
-        outPath = null;
-        status = 'ভিডিও রেডি';
-      });
+  void _step(String l, [double? p]) {
+    if (!mounted) return;
+    setState(() {
+      label = l;
+      if (p != null) progress = p.clamp(0.0, 1.0);
+    });
+  }
+
+  String _fileName(String? p) => p == null ? 'বাছাই করা হয়নি' : p.split('/').last;
+
+  String _base(String p) {
+    var n = p.split('/').last;
+    final i = n.lastIndexOf('.');
+    if (i > 0) n = n.substring(0, i);
+    n = n.replaceAll(RegExp(r'[^A-Za-z0-9_\-\u0980-\u09FF]'), '_');
+    return n.length > 40 ? n.substring(0, 40) : n;
+  }
+
+  String _ts() {
+    final d = DateTime.now();
+    String t(int x) => x.toString().padLeft(2, '0');
+    return '${d.year}${t(d.month)}${t(d.day)}_${t(d.hour)}${t(d.minute)}${t(d.second)}';
+  }
+
+  Future<String?> _pick(FileType type) async {
+    final r = await FilePicker.platform.pickFiles(type: type);
+    return r?.files.single.path;
+  }
+
+  // ---------- স্টোরেজ ----------
+  Future<void> _ensureStorage() async {
+    if (!Platform.isAndroid) return;
+    var ok = await Permission.manageExternalStorage.isGranted;
+    if (!ok) ok = (await Permission.manageExternalStorage.request()).isGranted;
+    if (!ok) ok = (await Permission.storage.request()).isGranted;
+    storageOk = ok;
+  }
+
+  Future<String> _save(String tmp, String sub, String base, String ext) async {
+    Directory dir;
+    if (storageOk) {
+      dir = Directory('$root/$sub');
+      try {
+        await dir.create(recursive: true);
+      } catch (_) {
+        storageOk = false;
+      }
     }
-  }
-
-  Future<void> pickDub() async {
-    final r = await FilePicker.platform.pickFiles(type: FileType.audio);
-    if (r?.files.single.path != null) {
-      setState(() {
-        dubPath = r!.files.single.path;
-        outPath = null;
-      });
+    if (!storageOk) {
+      fallbackUsed = true;
+      final b = (await getExternalStorageDirectory()) ??
+          await getApplicationDocumentsDirectory();
+      dir = Directory('${b.path}/$sub');
+      await dir.create(recursive: true);
+    } else {
+      dir = Directory('$root/$sub');
     }
+    final dest = '${dir.path}/${base}_${_ts()}.$ext';
+    await File(tmp).copy(dest);
+    try {
+      await File(tmp).delete();
+    } catch (_) {}
+    return dest;
   }
 
-  Future<void> pickAudioSrc() async {
-    final r = await FilePicker.platform.pickFiles(type: FileType.audio);
-    if (r?.files.single.path != null) {
-      setState(() {
-        audioSrc = r!.files.single.path;
-        outPath = null;
-        status = 'অডিও রেডি';
-      });
+  Future<String> _tmp(String ext) async {
+    final d = await getTemporaryDirectory();
+    return '${d.path}/t_${DateTime.now().microsecondsSinceEpoch}.$ext';
+  }
+
+  // ---------- ffmpeg ----------
+  Future<bool> _ff(List<String> args,
+      {double? total, double from = 0, double to = 1}) async {
+    final c = Completer<bool>();
+    await FFmpegKit.executeWithArgumentsAsync(args, (s) async {
+      c.complete(ReturnCode.isSuccess(await s.getReturnCode()));
+    }, null, total == null
+        ? null
+        : (stat) {
+            final num t = stat.getTime();
+            if (t > 0 && total > 0) {
+              final f = ((t / 1000) / total).clamp(0.0, 1.0);
+              _step(label, from + (to - from) * f);
+            }
+          });
+    return c.future;
+  }
+
+  Future<double> _dur(String p) async {
+    final s = await FFmpegKit.executeWithArguments(['-i', p]);
+    final log = await s.getAllLogsAsString() ?? '';
+    final m = RegExp(r'Duration: (\d+):(\d+):(\d+\.?\d*)').firstMatch(log);
+    if (m == null) return 0;
+    return int.parse(m[1]!) * 3600 +
+        int.parse(m[2]!) * 60 +
+        double.parse(m[3]!);
+  }
+
+  // ---------- কাজ চালানোর কমন সিস্টেম ----------
+  Future<void> _start(String k, String name, Future<String> Function() job) async {
+    if (busy) {
+      _toast('⏳ "$busyName" এখনো চলছে। শেষ না হওয়া পর্যন্ত অপেক্ষা করুন।');
+      return;
     }
-  }
-
-  Future<String> _outFile(String ext) async {
-    final dir = (await getExternalStorageDirectory()) ??
-        await getApplicationDocumentsDirectory();
-    final t = DateTime.now().millisecondsSinceEpoch;
-    return '${dir.path}/audio_$t.$ext';
-  }
-
-  Future<bool> _ff(List<String> args) async {
-    final s = await FFmpegKit.executeWithArguments(args);
-    return ReturnCode.isSuccess(await s.getReturnCode());
-  }
-
-  Future<void> _run(List<String> args, String out, String doneMsg) async {
     setState(() {
       busy = true;
-      status = 'প্রসেস হচ্ছে...';
+      busyName = name;
+      label = 'শুরু হচ্ছে...';
+      progress = 0;
+      fallbackUsed = false;
+      results.remove(k);
+      status[k] = '⏳ কাজ চলছে...';
     });
-    final ok = await _ff(args);
-    setState(() {
-      busy = false;
-      if (ok) {
-        outPath = out;
-        status = doneMsg;
-      } else {
-        status = 'ব্যর্থ হয়েছে! অন্য ফাইল চেষ্টা করুন';
-      }
-    });
+    try {
+      final p = await job();
+      setState(() {
+        results[k] = p;
+        progress = 1;
+        status[k] = '✅ সম্পন্ন!'
+            '${fallbackUsed ? "\n(স্টোরেজ পারমিশন না দেওয়ায় অ্যাপের নিজস্ব ফোল্ডারে সেভ হয়েছে)" : ""}';
+      });
+      _toast('✅ $name শেষ হয়েছে');
+    } catch (e) {
+      setState(() => status[k] = '❌ ব্যর্থ: $e');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
   }
 
-  // ভিডিও থেকে অডিও এক্সট্রাক্ট (MP3)
-  Future<void> extract() async {
-    if (videoPath == null) return;
-    final out = await _outFile('mp3');
-    await _run(
-        ['-y', '-i', videoPath!, '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', out],
-        out,
-        'MP3 এক্সট্রাক্ট সফল ✅');
+  // ---------- কাজ ১: অডিও এক্সট্রাক্ট ----------
+  Future<String> _jobExtract(String video) async {
+    _step('পারমিশন চেক...', 0.01);
+    await _ensureStorage();
+    _step('MP3 বের হচ্ছে...', 0.03);
+    final total = await _dur(video);
+    final tmp = await _tmp('mp3');
+    final ok = await _ff(
+        ['-y', '-i', video, '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', tmp],
+        total: total, from: 0.03, to: 0.97);
+    if (!ok) throw 'এক্সট্রাক্ট হয়নি (ভিডিওতে অডিও আছে?)';
+    _step('ফাইল সেভ হচ্ছে...', 0.98);
+    return _save(tmp, 'Extracted_Audio', _base(video), 'mp3');
   }
 
-  // নিজের অডিও দিয়ে ম্যানুয়াল ডাব
-  Future<void> dub() async {
-    if (videoPath == null || dubPath == null) return;
-    final out = await _outFile('mp4');
-    await _run([
-      '-y', '-i', videoPath!, '-i', dubPath!,
+  // ---------- কাজ ২: অডিও রিপ্লেস ----------
+  Future<String> _jobReplace(String video, String audio) async {
+    _step('পারমিশন চেক...', 0.01);
+    await _ensureStorage();
+    _step('ভিডিওতে নতুন অডিও বসছে...', 0.03);
+    final total = await _dur(video);
+    final tmp = await _tmp('mp4');
+    final ok = await _ff([
+      '-y', '-i', video, '-i', audio,
       '-map', '0:v:0', '-map', '1:a:0',
-      '-c:v', 'copy', '-c:a', 'aac', '-shortest', out
-    ], out, 'ডাবিং সফল ✅');
+      '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', tmp
+    ], total: total, from: 0.03, to: 0.97);
+    if (!ok) throw 'অডিও রিপ্লেস হয়নি';
+    _step('ফাইল সেভ হচ্ছে...', 0.98);
+    return _save(tmp, 'Replaced_Video', _base(video), 'mp4');
   }
 
-  // ---------- AI ডাব (ফ্রি সিস্টেম) ----------
-
-  // 1) Speech-to-Text: Groq Whisper (ফ্রি key), যেকোনো ভাষা অটো ডিটেক্ট
+  // ---------- কাজ ৩: AI ডাব ----------
   Future<List<Seg>> _transcribe(String audio, String key) async {
     final req = http.MultipartRequest(
         'POST', Uri.parse('https://api.groq.com/openai/v1/audio/transcriptions'));
@@ -156,7 +258,6 @@ class _HomeState extends State<Home> {
         .toList();
   }
 
-  // 2) অনুবাদ: Google Translate (ফ্রি, key লাগে না)
   Future<String> _translate(String t, String tl) async {
     final uri = Uri.https('translate.googleapis.com', '/translate_a/single',
         {'client': 'gtx', 'sl': 'auto', 'tl': tl, 'dt': 't', 'q': t});
@@ -181,7 +282,6 @@ class _HomeState extends State<Home> {
     return out;
   }
 
-  // 3) Text-to-Speech: Google TTS (ফ্রি, key লাগে না)
   Future<void> _tts(String text, String tl, String path) async {
     final sink = File(path).openWrite();
     for (final c in _chunks(text)) {
@@ -198,209 +298,286 @@ class _HomeState extends State<Home> {
     await sink.close();
   }
 
-  Future<double> _dur(String p) async {
-    final s = await FFmpegKit.executeWithArguments(['-i', p]);
-    final log = await s.getAllLogsAsString() ?? '';
-    final m = RegExp(r'Duration: (\d+):(\d+):(\d+\.?\d*)').firstMatch(log);
-    if (m == null) return 0;
-    return int.parse(m[1]!) * 3600 +
-        int.parse(m[2]!) * 60 +
-        double.parse(m[3]!);
-  }
-
-  void _st(String m) => setState(() => status = m);
-
-  Future<void> aiDub({bool audioOnly = false}) async {
+  Future<String> _jobAi(String src, bool audioOnly) async {
     final key = keyCtrl.text.trim();
-    final src = audioOnly ? audioSrc : videoPath;
-    if (src == null) return;
-    if (key.isEmpty) {
-      _st('আগে Groq API key দিন (ফ্রি)');
-      return;
-    }
+    if (key.isEmpty) throw 'আগে Groq API key দিন (ফ্রি)';
     (await SharedPreferences.getInstance()).setString('groq_key', key);
-    setState(() {
-      busy = true;
-      outPath = null;
-    });
-    try {
-      final tmp = await getTemporaryDirectory();
-      final id = DateTime.now().millisecondsSinceEpoch;
 
-      _st('১/৪ অডিও বের হচ্ছে...');
-      final wav = '${tmp.path}/src_$id.mp3';
-      if (!await _ff(['-y', '-i', src, '-vn', '-ac', '1', '-ar', '16000',
-        '-c:a', 'libmp3lame', '-b:a', '48k', wav])) {
-        throw 'অডিও এক্সট্রাক্ট ব্যর্থ';
-      }
+    _step('পারমিশন চেক...', 0.01);
+    await _ensureStorage();
 
-      _st('২/৪ কথা টেক্সটে রূপান্তর হচ্ছে...');
-      final segs = await _transcribe(wav, key);
-      if (segs.isEmpty) throw 'ভিডিওতে কোনো কথা পাওয়া যায়নি';
+    final id = DateTime.now().millisecondsSinceEpoch;
+    final tmpDir = await getTemporaryDirectory();
+    final total = await _dur(src);
 
-      final files = <String>[];
-      final used = <Seg>[];
-      for (var i = 0; i < segs.length; i++) {
-        _st('৩/৪ অনুবাদ ও ভয়েস তৈরি ${i + 1}/${segs.length}');
-        final tr = await _translate(segs[i].text, lang);
-        if (tr.trim().isEmpty) continue;
-        final f = '${tmp.path}/seg_${id}_$i.mp3';
-        await _tts(tr, lang, f);
-        files.add(f);
-        used.add(segs[i]);
-      }
-      if (files.isEmpty) throw 'ভয়েস তৈরি হয়নি';
-
-      _st('৪/৪ ভিডিওতে বসানো হচ্ছে...');
-      final fc = StringBuffer();
-      final labels = StringBuffer();
-      for (var i = 0; i < files.length; i++) {
-        final s = used[i];
-        final nextStart =
-            i + 1 < used.length ? used[i + 1].start : s.end + 1.0;
-        final slot = (nextStart - s.start).clamp(0.5, 1000.0);
-        final d = await _dur(files[i]);
-        var tempo = d > slot ? d / slot : 1.0;
-        if (tempo > 1.8) tempo = 1.8;
-        final ms = (s.start * 1000).round();
-        final t = tempo > 1.01 ? 'atempo=${tempo.toStringAsFixed(3)},' : '';
-        final idx = audioOnly ? i : i + 1;
-        fc.write('[$idx:a]${t}adelay=$ms|$ms[a$i];');
-        labels.write('[a$i]');
-      }
-      fc.write('${labels}amix=inputs=${files.length}:normalize=0[out]');
-
-      final out = await _outFile(audioOnly ? 'mp3' : 'mp4');
-      final List<String> args =
-          audioOnly ? ['-y'] : ['-y', '-i', videoPath!];
-      for (final f in files) {
-        args.addAll(['-i', f]);
-      }
-      if (audioOnly) {
-        args.addAll(['-filter_complex', fc.toString(), '-map', '[out]',
-          '-c:a', 'libmp3lame', '-b:a', '192k', out]);
-      } else {
-        args.addAll(['-filter_complex', fc.toString(), '-map', '0:v:0',
-          '-map', '[out]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', out]);
-      }
-      if (!await _ff(args)) throw 'মার্জ ব্যর্থ';
-
-      setState(() {
-        outPath = out;
-        status = 'AI ডাবিং সফল ✅';
-      });
-    } catch (e) {
-      _st('ব্যর্থ: $e');
-    } finally {
-      setState(() => busy = false);
+    _step('১/৪ অডিও বের হচ্ছে...', 0.03);
+    final mp3 = '${tmpDir.path}/src_$id.mp3';
+    if (!await _ff(['-y', '-i', src, '-vn', '-ac', '1', '-ar', '16000',
+      '-c:a', 'libmp3lame', '-b:a', '48k', mp3])) {
+      throw 'অডিও এক্সট্রাক্ট হয়নি';
     }
+
+    _step('২/৪ কথা শুনে টেক্সট করা হচ্ছে (একটু সময় লাগবে)...', 0.08);
+    final segs = await _transcribe(mp3, key);
+    if (segs.isEmpty) throw 'কোনো কথা পাওয়া যায়নি';
+
+    final files = <String>[];
+    final used = <Seg>[];
+    for (var i = 0; i < segs.length; i++) {
+      _step('৩/৪ অনুবাদ ও ভয়েস তৈরি ${i + 1}/${segs.length}',
+          0.25 + 0.60 * (i / segs.length));
+      final tr = await _translate(segs[i].text, lang);
+      if (tr.trim().isEmpty) continue;
+      final f = '${tmpDir.path}/seg_${id}_$i.mp3';
+      await _tts(tr, lang, f);
+      files.add(f);
+      used.add(segs[i]);
+    }
+    if (files.isEmpty) throw 'ভয়েস তৈরি হয়নি';
+
+    _step('৪/৪ ফাইনাল ফাইল তৈরি হচ্ছে...', 0.86);
+    final fc = StringBuffer();
+    final labels = StringBuffer();
+    for (var i = 0; i < files.length; i++) {
+      final s = used[i];
+      final nextStart = i + 1 < used.length ? used[i + 1].start : s.end + 1.0;
+      final slot = (nextStart - s.start).clamp(0.5, 1000.0);
+      final d = await _dur(files[i]);
+      var tempo = d > slot ? d / slot : 1.0;
+      if (tempo > 1.8) tempo = 1.8;
+      final ms = (s.start * 1000).round();
+      final t = tempo > 1.01 ? 'atempo=${tempo.toStringAsFixed(3)},' : '';
+      final idx = audioOnly ? i : i + 1;
+      fc.write('[$idx:a]${t}adelay=$ms|$ms[a$i];');
+      labels.write('[a$i]');
+    }
+    fc.write('${labels}amix=inputs=${files.length}:normalize=0[out]');
+
+    final tmp = await _tmp(audioOnly ? 'mp3' : 'mp4');
+    final List<String> args = audioOnly ? ['-y'] : ['-y', '-i', src];
+    for (final f in files) {
+      args.addAll(['-i', f]);
+    }
+    if (audioOnly) {
+      args.addAll(['-filter_complex', fc.toString(), '-map', '[out]',
+        '-c:a', 'libmp3lame', '-b:a', '192k', tmp]);
+    } else {
+      args.addAll(['-filter_complex', fc.toString(), '-map', '0:v:0',
+        '-map', '[out]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', tmp]);
+    }
+    if (!await _ff(args, total: total, from: 0.86, to: 0.97)) {
+      throw 'ফাইনাল ফাইল তৈরি হয়নি';
+    }
+
+    for (final f in files) {
+      try {
+        await File(f).delete();
+      } catch (_) {}
+    }
+    try {
+      await File(mp3).delete();
+    } catch (_) {}
+
+    _step('ফাইল সেভ হচ্ছে...', 0.98);
+    return audioOnly
+        ? _save(tmp, 'AI_Dubbed_Audio', _base(src), 'mp3')
+        : _save(tmp, 'AI_Dubbed_Video', _base(src), 'mp4');
   }
+
+  // ---------- UI কম্পোনেন্ট ----------
+  Widget _title(String t, String sub) => Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(t, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 4),
+          Text(sub, style: TextStyle(color: Colors.grey.shade700)),
+        ]),
+      );
+
+  Widget _fileTile(String title, IconData icon, String? path, VoidCallback onPick) {
+    return Card(
+      child: ListTile(
+        leading: Icon(icon, color: path == null ? null : Colors.green),
+        title: Text(title),
+        subtitle: Text(_fileName(path), maxLines: 1, overflow: TextOverflow.ellipsis),
+        trailing: FilledButton.tonal(
+            onPressed: busy ? () => _toast('⏳ কাজ চলছে, একটু অপেক্ষা করুন') : onPick,
+            child: Text(path == null ? 'Select' : 'Change')),
+      ),
+    );
+  }
+
+  Widget _action(String text, IconData icon, VoidCallback onTap) => FilledButton.icon(
+        onPressed: onTap,
+        icon: Icon(icon),
+        label: Text(text),
+        style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+      );
+
+  Widget _result(String k) {
+    final st = status[k];
+    if (st == null) return const SizedBox();
+    final p = results[k];
+    return Card(
+      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(st, style: const TextStyle(fontWeight: FontWeight.w600)),
+          if (p != null) ...[
+            const SizedBox(height: 6),
+            const Text('সেভ হয়েছে:', style: TextStyle(fontSize: 12)),
+            SelectableText(p, style: const TextStyle(fontSize: 12)),
+            const SizedBox(height: 6),
+            OutlinedButton.icon(
+              onPressed: () => Share.shareXFiles([XFile(p)]),
+              icon: const Icon(Icons.share),
+              label: const Text('Share'),
+            ),
+          ],
+        ]),
+      ),
+    );
+  }
+
+  Widget _progressCard() {
+    final pct = (progress * 100).round();
+    return Material(
+      color: Theme.of(context).colorScheme.primaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Expanded(
+                child: Text('⏳ $busyName চলছে',
+                    style: const TextStyle(fontWeight: FontWeight.bold))),
+            Text('$pct%', style: const TextStyle(fontWeight: FontWeight.bold)),
+          ]),
+          const SizedBox(height: 6),
+          LinearProgressIndicator(value: progress <= 0 ? null : progress),
+          const SizedBox(height: 6),
+          Text(label, style: const TextStyle(fontSize: 12)),
+        ]),
+      ),
+    );
+  }
+
+  // ---------- ট্যাব ১: এক্সট্রাক্ট ----------
+  Widget _tabExtract() => ListView(padding: const EdgeInsets.all(16), children: [
+        _title('🎵 ভিডিও থেকে অডিও বের করুন',
+            'ভিডিও দিন → MP3 অডিও ফাইল পাবেন।'),
+        _fileTile('ধাপ ১: ভিডিও সিলেক্ট', Icons.movie, exVideo, () async {
+          final p = await _pick(FileType.video);
+          if (p != null) setState(() => exVideo = p);
+        }),
+        const SizedBox(height: 8),
+        _action('ধাপ ২: MP3 এক্সট্রাক্ট করুন', Icons.audiotrack, () {
+          if (exVideo == null) return _toast('আগে ভিডিও সিলেক্ট করুন');
+          _start('ex', 'অডিও এক্সট্রাক্ট', () => _jobExtract(exVideo!));
+        }),
+        const SizedBox(height: 12),
+        _result('ex'),
+        const Text('📁 সেভ হবে: Internal storage / AudioTool / Extracted_Audio',
+            style: TextStyle(fontSize: 12)),
+      ]);
+
+  // ---------- ট্যাব ২: AI ডাব ----------
+  Widget _tabAi() => ListView(padding: const EdgeInsets.all(16), children: [
+        _title('🤖 AI অটো ডাব (বাংলা / হিন্দি)',
+            'যেকোনো ভাষার কথা নিজে থেকে বাংলা বা হিন্দিতে ডাব হবে।'),
+        TextField(
+          controller: keyCtrl,
+          obscureText: true,
+          decoration: const InputDecoration(
+            labelText: 'Groq API Key (ফ্রি)',
+            helperText: 'console.groq.com/keys থেকে ফ্রিতে নিন',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 10),
+        SegmentedButton<String>(
+          segments: const [
+            ButtonSegment(value: 'bn', label: Text('বাংলা')),
+            ButtonSegment(value: 'hi', label: Text('हिन्दी')),
+          ],
+          selected: {lang},
+          onSelectionChanged: (s) => setState(() => lang = s.first),
+        ),
+        const Divider(height: 32),
+        const Text('ক) ভিডিও → ডাব করা ভিডিও',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+        const SizedBox(height: 8),
+        _fileTile('ভিডিও সিলেক্ট', Icons.movie, aiVideo, () async {
+          final p = await _pick(FileType.video);
+          if (p != null) setState(() => aiVideo = p);
+        }),
+        const SizedBox(height: 8),
+        _action('ভিডিও AI ডাব করুন', Icons.auto_awesome, () {
+          if (aiVideo == null) return _toast('আগে ভিডিও সিলেক্ট করুন');
+          _start('aiV', 'AI ভিডিও ডাব', () => _jobAi(aiVideo!, false));
+        }),
+        _result('aiV'),
+        const Text('📁 AudioTool / AI_Dubbed_Video',
+            style: TextStyle(fontSize: 12)),
+        const Divider(height: 32),
+        const Text('খ) অডিও → ডাব করা MP3',
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+        const SizedBox(height: 8),
+        _fileTile('অডিও সিলেক্ট', Icons.audio_file, aiAudio, () async {
+          final p = await _pick(FileType.audio);
+          if (p != null) setState(() => aiAudio = p);
+        }),
+        const SizedBox(height: 8),
+        _action('অডিও AI ডাব করুন (MP3)', Icons.auto_awesome, () {
+          if (aiAudio == null) return _toast('আগে অডিও সিলেক্ট করুন');
+          _start('aiA', 'AI অডিও ডাব', () => _jobAi(aiAudio!, true));
+        }),
+        _result('aiA'),
+        const Text('📁 AudioTool / AI_Dubbed_Audio',
+            style: TextStyle(fontSize: 12)),
+      ]);
+
+  // ---------- ট্যাব ৩: রিপ্লেস ----------
+  Widget _tabReplace() => ListView(padding: const EdgeInsets.all(16), children: [
+        _title('🔁 ভিডিওর অডিও বদলান',
+            'ভিডিওর পুরনো অডিও মুছে আপনার দেওয়া অডিও বসবে। এক্সট্রাক্ট বা AI ডাব করা যেকোনো অডিও এখানে দিতে পারেন।'),
+        _fileTile('ধাপ ১: ভিডিও', Icons.movie, rpVideo, () async {
+          final p = await _pick(FileType.video);
+          if (p != null) setState(() => rpVideo = p);
+        }),
+        _fileTile('ধাপ ২: নতুন অডিও (যেটা বসাবেন)', Icons.audio_file, rpAudio,
+            () async {
+          final p = await _pick(FileType.audio);
+          if (p != null) setState(() => rpAudio = p);
+        }),
+        const SizedBox(height: 8),
+        _action('ধাপ ৩: অডিও রিপ্লেস করুন', Icons.swap_horiz, () {
+          if (rpVideo == null) return _toast('আগে ভিডিও সিলেক্ট করুন');
+          if (rpAudio == null) return _toast('আগে নতুন অডিও সিলেক্ট করুন');
+          _start('rp', 'অডিও রিপ্লেস', () => _jobReplace(rpVideo!, rpAudio!));
+        }),
+        const SizedBox(height: 12),
+        _result('rp'),
+        const Text('📁 সেভ হবে: Internal storage / AudioTool / Replaced_Video',
+            style: TextStyle(fontSize: 12)),
+      ]);
 
   @override
   Widget build(BuildContext context) {
+    final pages = [_tabExtract, _tabAi, _tabReplace];
     return Scaffold(
-      appBar: AppBar(title: const Text('Audio Extractor & Dub')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          Card(
-            child: ListTile(
-              leading: const Icon(Icons.movie),
-              title: const Text('ভিডিও'),
-              subtitle: Text(_name(videoPath)),
-              trailing: FilledButton(
-                  onPressed: busy ? null : pickVideo, child: const Text('Select')),
-            ),
-          ),
-          const SizedBox(height: 8),
-          FilledButton.icon(
-            onPressed: busy || videoPath == null ? null : extract,
-            icon: const Icon(Icons.audiotrack),
-            label: const Text('MP3 এক্সট্রাক্ট করুন'),
-          ),
-          const Divider(height: 32),
-          const Text('🤖 AI অটো ডাব (ফ্রি)',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-          const SizedBox(height: 8),
-          TextField(
-            controller: keyCtrl,
-            obscureText: true,
-            decoration: const InputDecoration(
-              labelText: 'Groq API Key (ফ্রি)',
-              helperText: 'console.groq.com/keys থেকে ফ্রিতে নিন',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 8),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'bn', label: Text('বাংলা')),
-              ButtonSegment(value: 'hi', label: Text('हिन्दी')),
-            ],
-            selected: {lang},
-            onSelectionChanged: busy ? null : (s) => setState(() => lang = s.first),
-          ),
-          const SizedBox(height: 8),
-          FilledButton.icon(
-            onPressed: busy || videoPath == null ? null : aiDub,
-            icon: const Icon(Icons.auto_awesome),
-            label: const Text('AI দিয়ে ডাব করুন'),
-          ),
-          const Divider(height: 32),
-          const Text('🎧 অডিও ফাইল AI ডাব (MP3 আউটপুট)',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-          const SizedBox(height: 8),
-          Card(
-            child: ListTile(
-              leading: const Icon(Icons.audio_file),
-              title: const Text('অডিও ফাইল'),
-              subtitle: Text(_name(audioSrc)),
-              trailing: OutlinedButton(
-                  onPressed: busy ? null : pickAudioSrc,
-                  child: const Text('Select')),
-            ),
-          ),
-          const SizedBox(height: 8),
-          FilledButton.icon(
-            onPressed:
-                busy || audioSrc == null ? null : () => aiDub(audioOnly: true),
-            icon: const Icon(Icons.auto_awesome),
-            label: const Text('অডিও AI ডাব করুন (MP3)'),
-          ),
-          const Divider(height: 32),
-          const Text('🎙️ নিজের অডিও দিয়ে ডাব',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-          const SizedBox(height: 8),
-          Card(
-            child: ListTile(
-              leading: const Icon(Icons.mic),
-              title: const Text('ডাব অডিও'),
-              subtitle: Text(_name(dubPath)),
-              trailing: OutlinedButton(
-                  onPressed: busy ? null : pickDub, child: const Text('Select')),
-            ),
-          ),
-          const SizedBox(height: 8),
-          FilledButton.tonalIcon(
-            onPressed: busy || videoPath == null || dubPath == null ? null : dub,
-            icon: const Icon(Icons.record_voice_over),
-            label: const Text('অডিও রিপ্লেস করুন'),
-          ),
-          const SizedBox(height: 24),
-          if (busy) const LinearProgressIndicator(),
-          const SizedBox(height: 8),
-          Text(status, textAlign: TextAlign.center),
-          if (outPath != null) ...[
-            const SizedBox(height: 8),
-            SelectableText(outPath!,
-                textAlign: TextAlign.center, style: const TextStyle(fontSize: 11)),
-            const SizedBox(height: 8),
-            OutlinedButton.icon(
-              onPressed: () => Share.shareXFiles([XFile(outPath!)]),
-              icon: const Icon(Icons.share),
-              label: const Text('Share / Save'),
-            ),
-          ],
+      appBar: AppBar(title: const Text('Vid2MP3')),
+      body: Column(children: [
+        if (busy) _progressCard(),
+        Expanded(child: pages[tab]()),
+      ]),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: tab,
+        onDestinationSelected: (i) => setState(() => tab = i),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.audiotrack), label: 'এক্সট্রাক্ট'),
+          NavigationDestination(icon: Icon(Icons.auto_awesome), label: 'AI ডাব'),
+          NavigationDestination(icon: Icon(Icons.swap_horiz), label: 'রিপ্লেস'),
         ],
       ),
     );
