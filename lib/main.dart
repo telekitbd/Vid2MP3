@@ -458,6 +458,19 @@ class _HomeState extends State<Home> {
         .toList();
   }
 
+  Future<T> _retry<T>(Future<T> Function() f, {int n = 4}) async {
+    for (var i = 1;; i++) {
+      try {
+        return await f();
+      } catch (e) {
+        if (i >= n) rethrow;
+        Log.add('নেটওয়ার্ক সমস্যা, আবার চেষ্টা ($i/${n - 1}): '
+            '${_tail(e.toString(), 120)}');
+        await Future.delayed(Duration(seconds: 2 * i));
+      }
+    }
+  }
+
   Future<String> _translate(String t, String tl) async {
     final uri = Uri.https('translate.googleapis.com', '/translate_a/single',
         {'client': 'gtx', 'sl': 'auto', 'tl': tl, 'dt': 't', 'q': t});
@@ -557,27 +570,36 @@ class _HomeState extends State<Home> {
       },
     });
 
-    const models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-3.5-flash'];
+    const models = [
+      'gemini-3.8-flash',
+      'gemini-3.5-flash-lite',
+      'gemini-3.5-flash',
+      'gemini-3.1-flash-lite',
+    ];
     String lastErr = 'unknown';
     for (final m in models) {
       Log.add('Gemini মডেল: $m');
-      http.Response res;
-      try {
-        res = await http
-            .post(
-                Uri.parse(
-                    'https://generativelanguage.googleapis.com/v1beta/models/$m:generateContent'),
-                headers: {
-                  'Content-Type': 'application/json',
-                  'x-goog-api-key': gKey,
-                },
-                body: body)
-            .timeout(const Duration(minutes: 5));
-      } catch (e) {
-        lastErr = '$m: $e';
-        Log.add('Gemini অনুরোধ ব্যর্থ: $e');
-        continue;
+      http.Response? resp;
+      for (var attempt = 1; attempt <= 3 && resp == null; attempt++) {
+        try {
+          resp = await http
+              .post(
+                  Uri.parse(
+                      'https://generativelanguage.googleapis.com/v1beta/models/$m:generateContent'),
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': gKey,
+                  },
+                  body: body)
+              .timeout(const Duration(minutes: 5));
+        } catch (e) {
+          lastErr = '$m: $e';
+          Log.add('Gemini অনুরোধ ব্যর্থ (চেষ্টা $attempt/3): $e');
+          if (attempt < 3) await Future.delayed(Duration(seconds: 3 * attempt));
+        }
       }
+      if (resp == null) continue;
+      final res = resp;
       if (res.statusCode != 200) {
         lastErr = '$m: HTTP ${res.statusCode}';
         Log.add('Gemini ${res.statusCode}: ${_tail(utf8.decode(res.bodyBytes), 400)}');
@@ -659,7 +681,7 @@ class _HomeState extends State<Home> {
     }
 
     _step('২/৫ কথা শুনে টেক্সট করা হচ্ছে (একটু সময় লাগবে)...', 0.08);
-    final segs = await _transcribe(mp3, key);
+    final segs = await _retry(() => _transcribe(mp3, key), n: 3);
     if (segs.isEmpty) throw 'কোনো কথা পাওয়া যায়নি';
 
     // ছেলে/মেয়ে — ব্যর্থ হলে সবাই 'female' (আগের মতো একই ভয়েস)
@@ -681,10 +703,10 @@ class _HomeState extends State<Home> {
     for (var i = 0; i < segs.length; i++) {
       _step('৪/৫ অনুবাদ ও ভয়েস তৈরি ${i + 1}/${segs.length}',
           0.25 + 0.60 * (i / segs.length));
-      final tr = await _translate(segs[i].text, lang);
+      final tr = await _retry(() => _translate(segs[i].text, lang));
       if (tr.trim().isEmpty) continue;
       var f = '${tmpDir.path}/seg_${id}_$i.mp3';
-      await _tts(tr, lang, f);
+      await _retry(() => _tts(tr, lang, f));
       if (genders[i] == 'male') f = await _maleVoice(f);
       files.add(f);
       used.add(segs[i]);
