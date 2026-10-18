@@ -436,6 +436,10 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
         if (!await Permission.ignoreBatteryOptimizations.isGranted) {
           final b = await Permission.ignoreBatteryOptimizations.request();
           Log.add('ব্যাটারি অপটিমাইজেশন ছাড়: ${b.name}');
+          if (!b.isGranted) {
+            _toast('ব্যাটারি সেটিংসে KonthoDub-কে \"Unrestricted\" করুন, নাহলে মিনিমাইজ করলে কাজ বন্ধ হবে');
+            await openAppSettings();
+          }
         }
       }
       _lastNotifPct = -1;
@@ -808,7 +812,30 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
     }
 
     _step('২/৫ কথা শুনে টেক্সট করা হচ্ছে (একটু সময় লাগবে)...', 0.08);
-    final segs = await _retry(() => _transcribe(mp3, key), n: 3);
+    final segs = <Seg>[];
+    const piece = 1200.0; // ২০ মিনিট করে টুকরা (Groq ফাইল লিমিট এড়াতে)
+    final parts = total > piece * 1.2 ? (total / piece).ceil() : 1;
+    if (parts == 1) {
+      segs.addAll(await _retry(() => _transcribe(mp3, key), n: 3));
+    } else {
+      for (var pi = 0; pi < parts; pi++) {
+        _step('২/৫ কথা শুনে টেক্সট করা হচ্ছে ${pi + 1}/$parts',
+            0.08 + 0.10 * (pi / parts));
+        final off = pi * piece;
+        final pf = '${tmpDir.path}/part_${id}_$pi.mp3';
+        if (!await _ff(['-y', '-ss', off.toStringAsFixed(2), '-t',
+          piece.toStringAsFixed(2), '-i', mp3, '-c:a', 'copy', pf], quiet: true)) {
+          throw 'অডিও টুকরা করা যায়নি';
+        }
+        final r = await _retry(() => _transcribe(pf, key), n: 3);
+        for (final x in r) {
+          segs.add(Seg(x.start + off, x.end + off, x.text));
+        }
+        try {
+          await File(pf).delete();
+        } catch (_) {}
+      }
+    }
     if (segs.isEmpty) throw 'কোনো কথা পাওয়া যায়নি';
 
     // ছেলে/মেয়ে — ব্যর্থ হলে সবাই 'female' (আগের মতো একই ভয়েস)
@@ -835,75 +862,138 @@ class _HomeState extends State<Home> with WidgetsBindingObserver {
       }
     }
 
-    final files = <String>[];
-    final used = <Seg>[];
     // প্রতি বক্তার জন্য আলাদা পিচ: ছেলে ভারী, মেয়ে স্বাভাবিক/একটু চিকন
     final order = <String, List<int>>{'male': [], 'female': []};
     const maleF = [0.74, 0.66, 0.82];
     const femaleF = [1.0, 1.10, 0.92];
+    final factors = List<double>.filled(segs.length, 1.0);
     for (var i = 0; i < segs.length; i++) {
-      _step('৪/৫ অনুবাদ ও ভয়েস তৈরি ${i + 1}/${segs.length}',
-          0.25 + 0.60 * (i / segs.length));
-      final tr = await _retry(() => _translate(segs[i].text, lang));
-      if (tr.trim().isEmpty) continue;
-      var f = '${tmpDir.path}/seg_${id}_$i.mp3';
-      await _retry(() => _tts(tr, lang, f));
       final g = genders[i];
       final lst = order[g]!;
       if (!lst.contains(spk[i])) lst.add(spk[i]);
       final idx = lst.indexOf(spk[i]) % 3;
-      f = await _shiftVoice(f, g == 'male' ? maleF[idx] : femaleF[idx]);
-      files.add(f);
-      used.add(segs[i]);
+      factors[i] = g == 'male' ? maleF[idx] : femaleF[idx];
+    }
+
+    // একসাথে অনেকগুলো সেগমেন্ট সমান্তরালে (আগে একটা একটা করে হতো)
+    const workers = 8;
+    final outFiles = List<String?>.filled(segs.length, null);
+    var next = 0, done = 0;
+    Future<void> worker() async {
+      while (true) {
+        final i = next++;
+        if (i >= segs.length) return;
+        final tr = await _retry(() => _translate(segs[i].text, lang));
+        if (tr.trim().isNotEmpty) {
+          final f = '${tmpDir.path}/seg_${id}_$i.mp3';
+          await _retry(() => _tts(tr, lang, f));
+          outFiles[i] = await _shiftVoice(f, factors[i]);
+        }
+        done++;
+        _step('৪/৫ অনুবাদ ও ভয়েস তৈরি $done/${segs.length}',
+            0.25 + 0.60 * (done / segs.length));
+      }
+    }
+
+    await Future.wait(List.generate(workers, (_) => worker()));
+    final files = <String>[];
+    final used = <Seg>[];
+    for (var i = 0; i < segs.length; i++) {
+      if (outFiles[i] != null) {
+        files.add(outFiles[i]!);
+        used.add(segs[i]);
+      }
     }
     if (files.isEmpty) throw 'ভয়েস তৈরি হয়নি';
 
     _step('৫/৫ ফাইনাল ফাইল তৈরি হচ্ছে...', 0.86);
-    final fc = StringBuffer();
-    final labels = StringBuffer();
-    final spans = <String>[]; // কথা চলার সময়গুলো (আসল অডিও নিচে নামানোর জন্য)
-    for (var i = 0; i < files.length; i++) {
-      final s = used[i];
-      final nextStart = i + 1 < used.length ? used[i + 1].start : s.end + 1.0;
-      final slot = (nextStart - s.start).clamp(0.5, 1000.0);
-      final d = await _dur(files[i]);
-      var tempo = d > slot ? d / slot : 1.0;
-      if (tempo > 1.8) tempo = 1.8;
-      final ms = (s.start * 1000).round();
-      final t = tempo > 1.01 ? 'atempo=${tempo.toStringAsFixed(3)},' : '';
-      final endAt = s.start + d / tempo;
-      final spanEnd = endAt > s.end ? endAt : s.end;
-      spans.add('between(t,${(s.start - 0.15).clamp(0, 1e9).toStringAsFixed(2)},'
-          '${(spanEnd + 0.25).toStringAsFixed(2)})');
-      // ইনপুট ০ = আসল ফাইল (ব্যাকগ্রাউন্ডের জন্য), ভয়েস ফাইল ১ থেকে
-      fc.write('[${i + 1}:a]${t}adelay=$ms|$ms[a$i];');
-      labels.write('[a$i]');
+    final spans = <List<double>>[];
+    const chunkSize = 15;
+    String? running; // এ পর্যন্ত মিক্স করা ভয়েস (wav)
+    for (var c = 0; c < files.length; c += chunkSize) {
+      final end = (c + chunkSize < files.length) ? c + chunkSize : files.length;
+      final fc = StringBuffer();
+      final labels = StringBuffer();
+      final a = <String>['-y'];
+      for (var i = c; i < end; i++) {
+        final s = used[i];
+        final nextStart = i + 1 < used.length ? used[i + 1].start : s.end + 1.0;
+        final slot = (nextStart - s.start).clamp(0.5, 1000.0);
+        final d = await _dur(files[i]);
+        var tempo = d > slot ? d / slot : 1.0;
+        if (tempo > 1.8) tempo = 1.8;
+        final ms = (s.start * 1000).round();
+        final t = tempo > 1.01 ? 'atempo=${tempo.toStringAsFixed(3)},' : '';
+        final endAt = s.start + d / tempo;
+        final spanEnd = endAt > s.end ? endAt : s.end;
+        spans.add([(s.start - 0.15).clamp(0, 1e9).toDouble(), spanEnd + 0.25]);
+        a.addAll(['-i', files[i]]);
+        final k = i - c;
+        fc.write('[$k:a]${t}adelay=$ms|$ms[a$k];');
+        labels.write('[a$k]');
+      }
+      var n = end - c;
+      if (running != null) {
+        a.addAll(['-i', running]);
+        labels.write('[$n:a]');
+        n++;
+      }
+      fc.write('${labels}amix=inputs=$n:duration=longest:normalize=0[out]');
+      final outWav = '${tmpDir.path}/mix_${id}_$c.wav';
+      a.addAll(['-filter_complex', fc.toString(), '-map', '[out]',
+        '-ac', '1', '-ar', '24000', '-c:a', 'pcm_s16le', outWav]);
+      if (!await _ff(a, quiet: true)) {
+        throw 'ভয়েস মিক্স হয়নি (ব্যাচ ${c ~/ chunkSize + 1})';
+      }
+      if (running != null) {
+        try {
+          await File(running).delete();
+        } catch (_) {}
+      }
+      running = outWav;
+      _step('৫/৫ মিক্স হচ্ছে $end/${files.length}',
+          0.86 + 0.08 * (end / files.length));
     }
-    final hasBg = keepBg;
-    if (hasBg) {
-      // কথার সময় আসল অডিও নিচে (bgVol), কথার ফাঁকে বেশি (০.৮) — মিউজিক/ইফেক্ট শোনা যাবে
+
+    // কথার সময়গুলো মার্জ করে এক্সপ্রেশন ছোট করা
+    spans.sort((x, y) => x[0].compareTo(y[0]));
+    final merged = <List<double>>[];
+    for (final sp in spans) {
+      if (merged.isNotEmpty && sp[0] <= merged.last[1]) {
+        if (sp[1] > merged.last[1]) merged.last[1] = sp[1];
+      } else {
+        merged.add([sp[0], sp[1]]);
+      }
+    }
+    final expr = merged
+        .map((m) =>
+            'between(t,${m[0].toStringAsFixed(2)},${m[1].toStringAsFixed(2)})')
+        .join('+');
+
+    final fcFinal = StringBuffer();
+    if (keepBg && expr.isNotEmpty) {
       final low = bgVol.toStringAsFixed(2);
-      fc.write("[0:a]volume='if(gt(${spans.join("+")},0),$low,0.8)':eval=frame[bg];");
-      labels.write('[bg]');
+      fcFinal.write("[0:a]volume='if(gt($expr,0),$low,0.8)':eval=frame[bg];"
+          '[bg][1:a]amix=inputs=2:duration=longest:normalize=0[out]');
+    } else {
+      fcFinal.write('[1:a]anull[out]');
     }
-    final n = files.length + (hasBg ? 1 : 0);
-    fc.write('${labels}amix=inputs=$n:duration=longest:normalize=0[out]');
 
     final tmp = await _tmp(audioOnly ? 'mp3' : 'mp4');
-    final List<String> args = ['-y', '-i', src];
-    for (final f in files) {
-      args.addAll(['-i', f]);
-    }
+    final List<String> args = ['-y', '-i', src, '-i', running!];
     if (audioOnly) {
-      args.addAll(['-filter_complex', fc.toString(), '-map', '[out]',
+      args.addAll(['-filter_complex', fcFinal.toString(), '-map', '[out]',
         '-c:a', 'libmp3lame', '-b:a', '192k', tmp]);
     } else {
-      args.addAll(['-filter_complex', fc.toString(), '-map', '0:v:0',
+      args.addAll(['-filter_complex', fcFinal.toString(), '-map', '0:v:0',
         '-map', '[out]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', tmp]);
     }
-    if (!await _ff(args, total: total, from: 0.86, to: 0.97)) {
+    if (!await _ff(args, total: total, from: 0.94, to: 0.97)) {
       throw 'ফাইনাল ফাইল তৈরি হয়নি';
     }
+    try {
+      await File(running).delete();
+    } catch (_) {}
 
     for (final f in files) {
       try {
